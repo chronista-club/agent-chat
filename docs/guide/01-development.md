@@ -15,6 +15,13 @@ Claude stream-json の翻訳は `crates/host/src/claude_translate.rs`。
 VP は既存の質問 router を保持し、GFP の adapter は control event と本文 event を合成する。
 GFP の adapter が commit 境界を使うのは、process host / replay の移行時。
 
+Codex app-server の逆方向要求（質問・承認・MCP 手続き）の台帳は `crates/host/src/codex_interactions.rs`。
+受理・許可可否・native へ返す応答の形を持ち、タイトルや詳細のラベルは持たない。
+各アプリはこの台帳を包み、自分のカード語彙（VP `CodexInteraction` / GFP `codex_requests::Request`）へ射影する。
+MCP ツール実行承認（空フォーム）は `McpApproval`、一般フォーム / URL は `McpElicitation`。
+会話内許可（`persist=session`）・信頼サーバーの自動許可・中断時の interrupt 判定も台帳が持つ。
+どの会話設定で自動許可するか（GFP のフルアクセス）はアプリが決める。
+
 ## 型変更と検証
 
 この repo の root で実行する。

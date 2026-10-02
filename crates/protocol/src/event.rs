@@ -369,6 +369,10 @@ pub struct CodexQuestion {
     pub question: String,
     pub options: Vec<QuestionOption>,
     pub is_secret: bool,
+    /// 選択肢に加えて自由記述を受け付ける（native の `isOther`）。旧 payload には無い。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "typescript", ts(as = "Option<bool>", optional))]
+    pub is_other: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

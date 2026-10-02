@@ -92,6 +92,7 @@ fn fixtures() -> Vec<(&'static str, ConversationEvent)> {
                             description: "候補".into(),
                         }],
                         is_secret: false,
+                        is_other: true,
                     }],
                 }],
             },

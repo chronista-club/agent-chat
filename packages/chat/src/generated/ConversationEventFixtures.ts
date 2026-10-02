@@ -32,7 +32,8 @@ export const CONVERSATION_EVENT_FIXTURES = {
                 "description": "候補"
               }
             ],
-            "is_secret": false
+            "is_secret": false,
+            "is_other": true
           }
         ],
         "blocking": true,
