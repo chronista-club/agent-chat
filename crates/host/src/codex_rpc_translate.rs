@@ -1,0 +1,563 @@
+//! codex app-server notification → [`ConversationEvent`] 翻訳（VP doc 41 §2-3、design 74）
+//!
+//! 常駐 app-server の item 層翻訳。turn / thread の lifecycle（SessionInit / TurnCompleted /
+//! Error）は各アプリの host が扱い、本 module は **item 系 notification だけ**を純翻訳する。
+//!
+//! ## 方針（doc 41 §1 の実測 wire + `generate-json-schema` 0.144.5 で固定）
+//!
+//! | notification | ConversationEvent |
+//! |--------------|-------------|
+//! | `item/agentMessage/delta` | `CodexMessage`（item 単位の増分） |
+//! | `item/reasoning/textDelta` / `summaryTextDelta` | `ThoughtChunk` |
+//! | `item/completed` agentMessage / reasoning | agentMessage は構造を含む全文で置換。reasoning は delta 未観測時のみ fallback |
+//! | `item/started` tool 系 | `ToolCall` |
+//! | `item/completed` tool 系 | `ToolCallUpdate`（started 未観測なら ToolCall を補完 — exec 版 codex_translate の規律を踏襲） |
+//! | `item/completed` mcpToolCall | 上に加えて `McpStatus`（connected / failed。常駐なので disconnected は出さない） |
+//! | その他（userMessage / mcpServer 状態 / tokenUsage 等） | 無視（未知 method に寛容 = protocol drift 吸収、doc 41 §5） |
+
+use std::collections::HashSet;
+
+use agent_chat_protocol::{CodexQuestion, ConversationEvent, QuestionOption};
+use serde_json::Value;
+
+/// 非同期質問の発話 1 件の上限。
+const MAX_ASYNC_QUESTION_BYTES: usize = 64 * 1024;
+
+/// tool 系 item の表示写像（exec 版と同じ語彙）。None = tool として扱わない type。
+///
+/// MCP は Claude と同じ `mcp__<server>__<tool>`。アプリはこの名前で変更系 tool を判定する
+/// （GFP の積算 MCP の発光更新）ので、server / tool を名前から落とさない。
+fn tool_name(item: &Value) -> Option<String> {
+    let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    Some(
+        match item_type {
+            "commandExecution" => "shell",
+            "fileChange" => "apply_patch",
+            "mcpToolCall" => {
+                return Some(match (item["server"].as_str(), item["tool"].as_str()) {
+                    (Some(server), Some(tool)) => format!("mcp__{server}__{tool}"),
+                    _ => "mcp".into(),
+                });
+            }
+            "dynamicToolCall" => "tool",
+            "webSearch" => "web_search",
+            "imageGeneration" => "image_generation",
+            _ => return None,
+        }
+        .into(),
+    )
+}
+
+/// ToolCall の input 表示: 既知 field を優先し、無ければ item 全体（exec 版と同じ方針）。
+/// MCP は引数だけ（server / tool は名前が持つ）。
+fn tool_input(item: &serde_json::Value) -> serde_json::Value {
+    if let Some(cmd) = item.get("command") {
+        return serde_json::json!({ "command": cmd, "cwd": item.get("cwd") });
+    }
+    if let Some(args) = item.get("arguments") {
+        return args.clone();
+    }
+    if let Some(q) = item.get("query") {
+        return serde_json::json!({ "query": q });
+    }
+    if let Some(changes) = item.get("changes") {
+        return serde_json::json!({ "changes": changes });
+    }
+    item.clone()
+}
+
+/// ToolCallUpdate の content / is_error（tool 種別ごとの結果表現差を吸収）。
+/// MCP の業務エラー（`result.isError`）と transport 失敗（`error`）をどちらも失敗として保つ。
+fn tool_result(item: &Value) -> (String, bool) {
+    let result = &item["result"];
+    let error = item.get("error").filter(|v| !v.is_null());
+    let failed = matches!(item["status"].as_str(), Some("failed" | "declined"))
+        || error.is_some()
+        || ["exitCode", "exit_code"]
+            .iter()
+            .find_map(|k| item.get(*k).and_then(Value::as_i64))
+            .is_some_and(|c| c != 0)
+        || result
+            .get("isError")
+            .or_else(|| result.get("is_error"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let content = ["aggregatedOutput", "aggregated_output", "output"]
+        .iter()
+        .find_map(|k| item.get(*k).and_then(Value::as_str))
+        .map(str::to_owned)
+        .or_else(|| {
+            error.map(|e| {
+                e.get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| e.to_string())
+            })
+        })
+        .or_else(|| {
+            result
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .map(|b| {
+                            b.get("text")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| b.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+        })
+        .or_else(|| (!result.is_null()).then(|| result.to_string()))
+        .unwrap_or_else(|| item["status"].as_str().unwrap_or_default().to_owned());
+    (content, failed)
+}
+
+/// reasoning item の全文（`summary` 優先、無ければ `content`。どちらも文字列 or 配列を許容）。
+fn reasoning_text(item: &serde_json::Value) -> String {
+    for key in ["summary", "content"] {
+        match item.get(key) {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => return s.clone(),
+            Some(serde_json::Value::Array(a)) => {
+                let joined: String = a
+                    .iter()
+                    .filter_map(|v| {
+                        v.as_str()
+                            .map(str::to_string)
+                            .or_else(|| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !joined.is_empty() {
+                    return joined;
+                }
+            }
+            _ => {}
+        }
+    }
+    String::new()
+}
+
+/// app-server notification の item 層翻訳器（1 host = 1 個、turn を跨いで生存）。
+#[derive(Debug, Default)]
+pub struct CodexRpcTranslator {
+    /// delta を観測した item id（completed の全文 fallback を抑止 — 重複防止）。
+    delta_seen: HashSet<String>,
+    /// `item/started` で ToolCall を emit 済みの item id（completed 側の補完判定）。
+    started_tools: HashSet<String>,
+}
+
+impl CodexRpcTranslator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// notification 1 件を食わせ、0 個以上の [`ConversationEvent`] を得る（純翻訳）。
+    /// lifecycle 系（thread/turn/error）は host が先に刈るため、ここに来るのは item 系のみ
+    /// という前提は**置かない** — 未知 method は無条件に空を返す（寛容）。
+    pub fn ingest(&mut self, method: &str, params: &serde_json::Value) -> Vec<ConversationEvent> {
+        match method {
+            "item/agentMessage/delta" => match params.get("delta").and_then(|v| v.as_str()) {
+                Some(d) if !d.is_empty() => {
+                    vec![ConversationEvent::CodexMessage {
+                        item_id: item_key(params),
+                        text: d.into(),
+                        questions: Vec::new(),
+                        append: true,
+                    }]
+                }
+                _ => Vec::new(),
+            },
+            "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
+                self.mark_delta(params);
+                match params.get("delta").and_then(|v| v.as_str()) {
+                    Some(d) if !d.is_empty() => {
+                        vec![ConversationEvent::ThoughtChunk { text: d.into() }]
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            "item/started" => {
+                let Some(item) = params.get("item") else {
+                    return Vec::new();
+                };
+                self.tool_started(item)
+            }
+            "item/completed" => {
+                let Some(item) = params.get("item") else {
+                    return Vec::new();
+                };
+                if item["type"] == "agentMessage" {
+                    vec![ConversationEvent::CodexMessage {
+                        item_id: item_key(params),
+                        text: item["text"].as_str().unwrap_or_default().into(),
+                        questions: async_questions(item).unwrap_or_default(),
+                        append: false,
+                    }]
+                } else {
+                    self.item_completed(item)
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn mark_delta(&mut self, params: &serde_json::Value) {
+        if let Some(id) = params.get("itemId").and_then(|v| v.as_str()) {
+            self.delta_seen.insert(id.to_string());
+        }
+    }
+
+    fn tool_started(&mut self, item: &serde_json::Value) -> Vec<ConversationEvent> {
+        let Some(name) = tool_name(item) else {
+            return Vec::new(); // agentMessage / reasoning / userMessage 等は started で何も出さない
+        };
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        self.started_tools.insert(id.clone());
+        vec![ConversationEvent::ToolCall {
+            id,
+            name,
+            input: tool_input(item),
+        }]
+    }
+
+    fn item_completed(&mut self, item: &serde_json::Value) -> Vec<ConversationEvent> {
+        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        match item_type {
+            "reasoning" => {
+                if self.delta_seen.remove(id) {
+                    return Vec::new();
+                }
+                let text = reasoning_text(item);
+                if text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![ConversationEvent::ThoughtChunk { text }]
+                }
+            }
+            _ => {
+                let Some(name) = tool_name(item) else {
+                    return Vec::new(); // userMessage / plan / review 等
+                };
+                let mut out = Vec::new();
+                if !self.started_tools.remove(id) {
+                    // started を観測していない completed は ToolCall を補完（行が浮かない）。
+                    out.push(ConversationEvent::ToolCall {
+                        id: id.to_string(),
+                        name,
+                        input: tool_input(item),
+                    });
+                }
+                let (content, is_error) = tool_result(item);
+                out.push(ConversationEvent::ToolCallUpdate {
+                    tool_use_id: id.to_string(),
+                    content,
+                    is_error,
+                });
+                // 呼び出せた / 失敗した MCP の接続状態（ヘッダの MCP 行）。
+                if item_type == "mcpToolCall"
+                    && let Some(server) = item["server"].as_str()
+                {
+                    let failed = item["status"] == "failed"
+                        || item.get("error").is_some_and(|v| !v.is_null());
+                    out.push(ConversationEvent::McpStatus {
+                        server: server.into(),
+                        status: if failed { "failed" } else { "connected" }.into(),
+                    });
+                }
+                out
+            }
+        }
+    }
+}
+
+/// 発話の表示キー（`<turnId>/<itemId>`）。delta と completed、履歴と live で同じになる。
+pub fn item_key(params: &Value) -> String {
+    format!(
+        "{}/{}",
+        params["turnId"].as_str().unwrap_or_default(),
+        params["itemId"]
+            .as_str()
+            .or_else(|| params["item"]["id"].as_str())
+            .unwrap_or_default()
+    )
+}
+
+/// 非同期質問（`delivery=async` の agentMessage）の構造。発話であり server request ではない。
+pub fn async_questions(item: &Value) -> Option<Vec<CodexQuestion>> {
+    if item["type"] != "agentMessage" || item["delivery"] != "async" {
+        return None;
+    }
+    let rows = item["questions"].as_array()?;
+    if rows.is_empty() || rows.len() > 16 || item.to_string().len() > MAX_ASYNC_QUESTION_BYTES {
+        return None;
+    }
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let title = row["title"].as_str()?.trim();
+            if title.is_empty() {
+                return None;
+            }
+            let options = match &row["options"] {
+                Value::Null => Vec::new(),
+                Value::Array(options) => options
+                    .iter()
+                    .map(|option| {
+                        Some(QuestionOption {
+                            label: option.as_str()?.into(),
+                            description: String::new(),
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+                _ => return None,
+            };
+            Some(CodexQuestion {
+                id: index.to_string(),
+                header: String::new(),
+                question: title.into(),
+                options,
+                is_secret: false,
+                is_other: false,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn async_question_preserves_structure_after_delta() {
+        let mut tr = CodexRpcTranslator::new();
+        tr.ingest(
+            "item/agentMessage/delta",
+            &serde_json::json!({"turnId":"turn","itemId":"q","delta":"途中"}),
+        );
+        let events = tr.ingest(
+            "item/completed",
+            &serde_json::json!({"turnId":"turn","item":{
+                "type":"agentMessage","id":"q","text":"どちら？\n- A","delivery":"async",
+                "questions":[{"title":"どちら？","options":["A"]}]
+            }}),
+        );
+        let value = serde_json::to_value(events).unwrap();
+        assert_eq!(value[0]["kind"], "codex_message");
+        assert_eq!(value[0]["item_id"], "turn/q");
+        assert_eq!(value[0]["questions"][0]["options"][0]["label"], "A");
+        assert_eq!(value[0]["append"], false);
+    }
+
+    /// 完成時の全文を捨てず、同一 item の置換として届ける。
+    #[test]
+    fn real_wire_agent_message_deltas_then_completed_suppressed() {
+        let mut tr = CodexRpcTranslator::new();
+        for text in ["pong", "-alpha"] {
+            let ev = tr.ingest(
+                "item/agentMessage/delta",
+                &serde_json::json!({"turnId":"turn","itemId":"msg","delta":text}),
+            );
+            assert_eq!(
+                ev,
+                vec![ConversationEvent::CodexMessage {
+                    item_id: "turn/msg".into(),
+                    text: text.into(),
+                    questions: Vec::new(),
+                    append: true,
+                }]
+            );
+        }
+        let done = tr.ingest("item/completed", &serde_json::json!({"turnId":"turn","item":{
+            "type":"agentMessage","id":"msg","text":"pong-alpha","phase":"final_answer","memoryCitation":null
+        }}));
+        assert_eq!(
+            done,
+            vec![ConversationEvent::CodexMessage {
+                item_id: "turn/msg".into(),
+                text: "pong-alpha".into(),
+                questions: Vec::new(),
+                append: false,
+            }]
+        );
+    }
+
+    /// userMessage（実測 wire）は echo しない（ChatView の optimistic bubble と二重になる）。
+    #[test]
+    fn user_message_items_are_ignored() {
+        let mut tr = CodexRpcTranslator::new();
+        let p: serde_json::Value = serde_json::from_str(
+            r#"{"item":{"type":"userMessage","id":"u1","clientId":null,"content":[{"type":"text","text":"hi"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(tr.ingest("item/started", &p), Vec::new());
+        assert_eq!(tr.ingest("item/completed", &p), Vec::new());
+    }
+
+    /// commandExecution: started=ToolCall（name=shell、exec 版と同語彙）/ completed=Update、
+    /// exitCode≠0 は is_error。
+    #[test]
+    fn command_execution_maps_to_shell_tool_pair() {
+        let mut tr = CodexRpcTranslator::new();
+        let started: serde_json::Value = serde_json::from_str(
+            r#"{"item":{"type":"commandExecution","id":"c1","command":"ls -la","cwd":"/w","status":"inProgress"}}"#,
+        )
+        .unwrap();
+        let ev = tr.ingest("item/started", &started);
+        assert_eq!(ev.len(), 1);
+        assert!(matches!(
+            &ev[0],
+            ConversationEvent::ToolCall { id, name, .. } if id == "c1" && name == "shell"
+        ));
+
+        let completed: serde_json::Value = serde_json::from_str(
+            r#"{"item":{"type":"commandExecution","id":"c1","command":"ls -la","aggregatedOutput":"file1\nfile2","exitCode":0,"status":"completed"}}"#,
+        )
+        .unwrap();
+        let ev = tr.ingest("item/completed", &completed);
+        assert_eq!(
+            ev,
+            vec![ConversationEvent::ToolCallUpdate {
+                tool_use_id: "c1".into(),
+                content: "file1\nfile2".into(),
+                is_error: false,
+            }],
+            "started 済みなので Update のみ"
+        );
+
+        // started 未観測 + exitCode≠0 → ToolCall 補完 + is_error
+        let failed: serde_json::Value = serde_json::from_str(
+            r#"{"item":{"type":"commandExecution","id":"c2","command":"false","aggregatedOutput":"","exitCode":1,"status":"failed"}}"#,
+        )
+        .unwrap();
+        let ev = tr.ingest("item/completed", &failed);
+        assert_eq!(ev.len(), 2, "ToolCall 補完 + Update");
+        assert!(matches!(&ev[0], ConversationEvent::ToolCall { id, .. } if id == "c2"));
+        assert!(matches!(
+            &ev[1],
+            ConversationEvent::ToolCallUpdate { is_error: true, .. }
+        ));
+    }
+
+    /// reasoning: delta 優先、delta 無し completed は summary/content から全文 fallback。
+    #[test]
+    fn reasoning_delta_then_completed_suppressed_and_fallback() {
+        let mut tr = CodexRpcTranslator::new();
+        let d: serde_json::Value =
+            serde_json::from_str(r#"{"itemId":"r1","delta":"考え中"}"#).unwrap();
+        assert_eq!(
+            tr.ingest("item/reasoning/textDelta", &d),
+            vec![ConversationEvent::ThoughtChunk {
+                text: "考え中".into()
+            }]
+        );
+        let done: serde_json::Value = serde_json::from_str(
+            r#"{"item":{"type":"reasoning","id":"r1","summary":["結論"],"content":null}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            tr.ingest("item/completed", &done),
+            Vec::new(),
+            "delta 済みは抑止"
+        );
+
+        let done2: serde_json::Value = serde_json::from_str(
+            r#"{"item":{"type":"reasoning","id":"r2","summary":[{"text":"要約 A"},{"text":"要約 B"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            tr.ingest("item/completed", &done2),
+            vec![ConversationEvent::ThoughtChunk {
+                text: "要約 A\n要約 B".into()
+            }]
+        );
+    }
+
+    /// mcpToolCall / webSearch / 未知 method の寛容性。
+    #[test]
+    fn mcp_web_and_unknown_methods() {
+        let mut tr = CodexRpcTranslator::new();
+        let mcp: serde_json::Value = serde_json::from_str(
+            r#"{"item":{"type":"mcpToolCall","id":"m1","server":"creo","tool":"remember","arguments":{"k":1},"status":"completed","result":{"ok":true},"error":null}}"#,
+        )
+        .unwrap();
+        let ev = tr.ingest("item/completed", &mcp);
+        assert_eq!(ev.len(), 3);
+        assert!(
+            matches!(&ev[0], ConversationEvent::ToolCall { name, input, .. } if name == "mcp__creo__remember" && input["k"] == 1)
+        );
+        assert!(
+            matches!(&ev[1], ConversationEvent::ToolCallUpdate { content, is_error: false, .. } if content.contains("ok"))
+        );
+        assert_eq!(
+            ev[2],
+            ConversationEvent::McpStatus {
+                server: "creo".into(),
+                status: "connected".into()
+            }
+        );
+
+        let ws: serde_json::Value = serde_json::from_str(
+            r#"{"item":{"type":"webSearch","id":"w1","query":"rust jsonl","action":null}}"#,
+        )
+        .unwrap();
+        let ev = tr.ingest("item/started", &ws);
+        assert!(matches!(&ev[0], ConversationEvent::ToolCall { name, .. } if name == "web_search"));
+
+        // 未知 method / 未知 item type は静かに無視（protocol drift 吸収）
+        assert_eq!(
+            tr.ingest("thread/tokenUsage/updated", &serde_json::json!({})),
+            Vec::new()
+        );
+        let unknown: serde_json::Value =
+            serde_json::from_str(r#"{"item":{"type":"sleep","id":"s1","durationMs":10}}"#).unwrap();
+        assert_eq!(tr.ingest("item/completed", &unknown), Vec::new());
+    }
+
+    /// MCP の業務エラーは失敗として扱い、本文は content の text を取る（GFP の積算 MCP、E1）。
+    #[test]
+    fn mcp_business_error_is_a_failure_with_text_content() {
+        let mut tr = CodexRpcTranslator::new();
+        let ev = tr.ingest(
+            "item/completed",
+            &serde_json::json!({"item":{"id":"m","type":"mcpToolCall","server":"gfp-estimate",
+                "tool":"AddItem","arguments":{"quantity":2},"status":"completed",
+                "result":{"content":[{"type":"text","text":"失敗"}],"isError":true}}}),
+        );
+        assert!(
+            matches!(&ev[0], ConversationEvent::ToolCall { name, .. } if name == "mcp__gfp-estimate__AddItem")
+        );
+        assert_eq!(
+            ev[1],
+            ConversationEvent::ToolCallUpdate {
+                tool_use_id: "m".into(),
+                content: "失敗".into(),
+                is_error: true,
+            }
+        );
+        // 業務エラーでも MCP は応答できている（接続は生きている）
+        assert!(
+            matches!(&ev[2], ConversationEvent::McpStatus { status, .. } if status == "connected")
+        );
+
+        let ev = tr.ingest(
+            "item/completed",
+            &serde_json::json!({"item":{"id":"t","type":"mcpToolCall","server":"gfp-estimate",
+                "tool":"GetSession","status":"failed","error":{"message":"timeout"}}}),
+        );
+        assert!(
+            matches!(&ev[1], ConversationEvent::ToolCallUpdate { content, is_error: true, .. } if content == "timeout")
+        );
+        assert!(
+            matches!(&ev[2], ConversationEvent::McpStatus { status, .. } if status == "failed")
+        );
+    }
+}

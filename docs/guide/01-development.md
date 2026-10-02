@@ -22,6 +22,10 @@ MCP ツール実行承認（空フォーム）は `McpApproval`、一般フォ�
 会話内許可（`persist=session`）・信頼サーバーの自動許可・中断時の interrupt 判定も台帳が持つ。
 どの会話設定で自動許可するか（GFP のフルアクセス）はアプリが決める。
 
+Codex app-server の item 系通知（本文 delta / completed、reasoning、tool、MCP）の翻訳は
+`crates/host/src/codex_rpc_translate.rs`。本文は item 単位の `CodexMessage`、MCP の tool 名は
+`mcp__<server>__<tool>`（アプリが変更系 tool を名前で判定する）。thread / turn の lifecycle は各アプリの host。
+
 ## 型変更と検証
 
 この repo の root で実行する。
