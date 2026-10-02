@@ -1,0 +1,53 @@
+# 01. 共有チャット基盤の開発
+
+> **Status**: Draft — ローカル移行中
+> **Related**: VP design 74、`mem_1CfcoK3QjHurVQ173tZDuA`
+
+## 正本
+
+Rust event と付随型は `crates/protocol/src/`。公開型を ts-rs で
+`packages/chat/src/generated/` へ生成し、両 consumer が package から読む。
+VP と GFP の旧 module path は互換 re-export であり、型を再定義しない。
+
+Claude stream-json の翻訳は `crates/host/src/claude_translate.rs`。
+本文・tool・usage・subagent・中断・transcript commit 境界を同じ実装で扱う。
+承認 control は `control_events` / `unanswerable_control_request` で別に読む。
+VP は既存の質問 router を保持し、GFP の adapter は control event と本文 event を合成する。
+GFP の adapter が commit 境界を使うのは、process host / replay の移行時。
+
+## 型変更と検証
+
+この repo の root で実行する。
+
+```sh
+cargo test --all-features
+cargo run -p agent-chat-protocol --features typescript --example export-types
+cargo fmt --all --check
+```
+
+`tests/fixtures.rs` が全 event kind の送信形を生成する。serde の
+`default` と `skip_serializing_if`、ts-rs の `optional` を別々に扱う。
+旧 payload の読取は `tests/contract.rs`、送り出す形は generated fixtures で検証する。
+生成型を手編集しない。新しい公開型を足したら `packages/chat/src/protocol.ts` の export も加える。
+
+両 consumer の WebView では、共有 package の更新後に以下を実行する。
+Bun `file:` 依存はキャッシュされるので再導入を省かない。
+
+```sh
+bun install --force
+./node_modules/.bin/tsc --noEmit
+bun run build
+```
+
+VP の WebView は `bun run test conversation-event-contract.test.ts chatview.test.ts`、
+GFP は `bun test src/shared-agent-chat.test.ts src/codex-interactions.test.ts src/echoes*.test.ts`。
+各 Rust workspace では VP `cargo test -p vantage-point --lib conversation`、
+GFP `cargo test -p gfp-app --lib echoes`。GFP は先に bundle を生成する。
+
+## 配布前の gate
+
+現在の Cargo path / Bun file は専用 worktree から共有 checkout を参照する開発依存。
+公開名・license・正式 version・配布方式の決定後、両 consumer が同じ release を参照する
+再現可能な依存へ置き換える。この状態で app release を作らない。
+process host / reducer / Solid UI はまだ各 consumer にある。
+protocol と Claude translator の共有だけではタスク完了でない。
