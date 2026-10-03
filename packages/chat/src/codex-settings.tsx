@@ -22,6 +22,8 @@ export type CodexSettingsProps = {
   error: string | null | undefined
   onSelection: (model: string, effort: string) => void
   onMode: (mode: string) => void
+  /** transport がモード変更を実装していない場合は操作不可にする。 */
+  modeAvailable?: boolean
   /** 権限の選択欄（アプリが所有する）。 */
   permission?: JSX.Element
 }
@@ -49,16 +51,17 @@ export function CodexRuntimeControls(props: {
   busy: boolean
   connected: boolean
   changeMode: (mode: string) => void
+  modeAvailable?: boolean
   permission?: JSX.Element
 }) {
   return <>
     <select class="conversation-model-select" aria-label="Codex mode"
       title="次の応答の進め方。Plan は計画、通常は実行。権限の設定は変更しません。"
-      disabled={props.busy || !props.connected}
+      disabled={props.busy || !props.connected || props.modeAvailable === false}
       onChange={event => {
         const selected = event.currentTarget.value
         event.currentTarget.value = props.runtime?.mode ?? ''
-        if (!props.busy && props.connected) props.changeMode(selected)
+        if (!props.busy && props.connected && props.modeAvailable !== false) props.changeMode(selected)
       }}>
       <Show when={!['plan', 'default'].includes(props.runtime?.mode ?? '')}>
         <option value="" selected disabled>モード未確認</option>
@@ -90,7 +93,7 @@ export function CodexSettingsControls(props: CodexSettingsProps) {
   const current = () => models().find(m => m.model === model())
   return <>
     <CodexRuntimeControls runtime={props.config?.runtime} busy={props.busy || !model()}
-      connected={props.connected} changeMode={props.onMode} permission={props.permission} />
+      connected={props.connected} modeAvailable={props.modeAvailable} changeMode={props.onMode} permission={props.permission} />
     <Show when={models().length > 0} fallback={<span class="conversation-model-readonly">{props.config?.error ?? 'モデル候補を取得中…'}</span>}>
       <select class="conversation-model-select" aria-label="Codex model" title="次の送信に使うモデル" disabled={props.busy}
         onChange={e => changeCodexSelection(e.currentTarget, model(), value => {
