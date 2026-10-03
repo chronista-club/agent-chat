@@ -57,8 +57,19 @@ GFP `cargo test -p gfp-app --lib echoes`。GFP は先に bundle を生成する�
 
 ## 配布前の gate
 
+Codex のプロセス起動は `codex_process::command` を VP/GFP が共用する。
+stdio の選択・pipe・kill-on-drop が共有側、CLI探索・cwd・identity env・MCP/rules の
+明示的な `-c` override がアプリ側。共有側は権限モードを補わない。
+`tests/codex_process.rs` は認証不要の実プロセスでこの境界を検証する。
+native 履歴は `codex_history::CodexHistory` が検証と表示用の変換を所有する（VP接続済み、
+GFPのnative履歴/UI接続は未移行）。空/重複IDの履歴を正常な空会話として受け入れない。
+
 現在の Cargo path / Bun file は専用 worktree から共有 checkout を参照する開発依存。
 公開名・license・正式 version・配布方式の決定後、両 consumer が同じ release を参照する
 再現可能な依存へ置き換える。この状態で app release を作らない。
 process host / reducer / Solid UI はまだ各 consumer にある。
 protocol と Claude translator の共有だけではタスク完了でない。
+
+GFP の native 入力境界は `codex_input` を使う。画像（base64・対応 MIME・decoded 5 MiB）、
+queue 操作の対象と一覧ページの形を共有側で検証する。transport、期限、通知との直列化、
+project/conversation 世代照合は consumer 側。現時点で VP の queue actor は独立実装のまま。
