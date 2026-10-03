@@ -24,6 +24,11 @@ export type CodexSettingsProps = {
   onMode: (mode: string) => void
   /** transport がモード変更を実装していない場合は操作不可にする。 */
   modeAvailable?: boolean
+  /**
+   * host が native の実効権限（`config.runtime`）を提供するか（既定 true）。false のときは「確認中」を出さず、
+   * 実効権限の表示をアプリに任せる（GFP は turn ごとに権限を明示するので native の設定値は実効値にならない）。
+   */
+  runtimeAvailable?: boolean
   /** 権限の選択欄（アプリが所有する）。 */
   permission?: JSX.Element
 }
@@ -52,6 +57,7 @@ export function CodexRuntimeControls(props: {
   connected: boolean
   changeMode: (mode: string) => void
   modeAvailable?: boolean
+  runtimeAvailable?: boolean
   permission?: JSX.Element
 }) {
   return <>
@@ -70,6 +76,7 @@ export function CodexRuntimeControls(props: {
       <option value="plan" selected={props.runtime?.mode === 'plan'}>Plan</option>
     </select>
     {props.permission}
+    <Show when={props.runtimeAvailable !== false}>
     <Show when={props.runtime} fallback={<span class="conversation-model-readonly">実効権限を確認中…</span>}>
       {runtime => <details class="conversation-model-readonly">
         <summary>実効権限{props.connected ? '' : '（最終確認）'}: {runtime().approval} / {runtime().sandbox}</summary>
@@ -82,6 +89,7 @@ export function CodexRuntimeControls(props: {
         </Show>
       </details>}
     </Show>
+    </Show>
   </>
 }
 
@@ -93,7 +101,8 @@ export function CodexSettingsControls(props: CodexSettingsProps) {
   const current = () => models().find(m => m.model === model())
   return <>
     <CodexRuntimeControls runtime={props.config?.runtime} busy={props.busy || !model()}
-      connected={props.connected} modeAvailable={props.modeAvailable} changeMode={props.onMode} permission={props.permission} />
+      connected={props.connected} modeAvailable={props.modeAvailable} runtimeAvailable={props.runtimeAvailable}
+      changeMode={props.onMode} permission={props.permission} />
     <Show when={models().length > 0} fallback={<span class="conversation-model-readonly">{props.config?.error ?? 'モデル候補を取得中…'}</span>}>
       <select class="conversation-model-select" aria-label="Codex model" title="次の送信に使うモデル" disabled={props.busy}
         onChange={e => changeCodexSelection(e.currentTarget, model(), value => {
