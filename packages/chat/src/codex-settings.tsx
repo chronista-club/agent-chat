@@ -1,5 +1,5 @@
 /**
- * Codex の入力設定（VP design 74 の UI 共有、GFP design 09）。
+ * Codex の入力設定（VP design 74 の UI 共有、GFP design 11）。
  *
  * モード（通常 / Plan）・実効権限の詳細・model / effort の選択・保存中 / エラー表示を共通にする。
  * **権限の選択欄はアプリが `permission` slot で差し込む**（VP = Codex 本体の権限メニュー、

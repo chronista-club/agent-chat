@@ -1,5 +1,5 @@
 /**
- * Codex の native queue（送信待ちの列）の表示と操作（VP design 74 の UI 共有、GFP design 10）。
+ * Codex の native queue（送信待ちの列）の表示と操作（VP design 74 の UI 共有、GFP design 12）。
  * 操作は `act`（`{kind: start|update|reorder|delete|refresh, …}`）でアプリの transport に渡す。
  */
 import { For, Show } from 'solid-js'
