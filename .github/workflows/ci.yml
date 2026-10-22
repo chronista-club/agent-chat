@@ -1,0 +1,49 @@
+name: CI
+
+# 共有チャット基盤の自前 gate（VP #1250 の独立 review 指摘、2026-10-23）。
+# consumer（VP / GFP）の CI は submodule 越しに同じ test と drift 検査を回すが、
+# 共有側の PR が自分で赤くなれるようにここでも回す。TS package は consumer の型検査 / bundle で検証する。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Format / Clippy / Test / Generated
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96 # = .mise.toml の rust / Cargo.toml の rust-version
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test
+        # tests/fixtures.rs が packages/chat/src/generated/ConversationEventFixtures.ts を再生成する。
+        run: cargo test --workspace --all-features --locked
+
+      - name: Export TypeScript types
+        run: cargo run -p agent-chat-protocol --features typescript --locked --example export-types
+
+      # 生成物（ts-rs 型 / serde fixture）が commit と一致しなければ赤。手編集や付け忘れをここで止める。
+      - name: Check generated files are committed
+        run: |
+          git diff --exit-code
+          test -z "$(git ls-files --others --exclude-standard)"
