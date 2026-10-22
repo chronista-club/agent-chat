@@ -1,7 +1,7 @@
 # 01. 共有チャット基盤の開発
 
 > **Status**: Draft — ローカル移行中
-> **Related**: VP design 74、`mem_1CfcoK3QjHurVQ173tZDuA`
+> **Related**: VP design 86（旧 74）、`mem_1CfcoK3QjHurVQ173tZDuA`
 
 ## 正本
 
