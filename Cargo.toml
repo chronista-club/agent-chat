@@ -6,4 +6,6 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+# publish は別裁定（0.1.0 は開発中の仮番号）。
 publish = false
