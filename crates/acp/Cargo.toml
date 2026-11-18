@@ -7,5 +7,14 @@ publish.workspace = true
 
 [dependencies]
 agent-chat-protocol = { path = "../protocol" }
+# feature なし: `process` / `stdio` は async-io の reactor と blocking の thread pool を持ち込む。
+agent-client-protocol = "5.3"
+futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }

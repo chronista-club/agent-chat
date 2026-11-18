@@ -141,13 +141,13 @@ export const CONVERSATION_EVENT_FIXTURES = {
     "name": "Bash",
     "input": {
       "command": "ls",
+      "timeout": 1000,
       "nested": {
         "a": [
           1,
           2
         ]
-      },
-      "timeout": 1000
+      }
     }
   },
   tool_call_update_ok: {
