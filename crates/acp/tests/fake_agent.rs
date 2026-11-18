@@ -44,6 +44,8 @@ struct Script {
     /// load の応答の後に流す update。
     after_load: Vec<Value>,
     load_error: bool,
+    /// `session/set_config_option` に答えない。
+    config_hang: bool,
     config: Vec<Value>,
     turns: VecDeque<Turn>,
 }
@@ -115,6 +117,7 @@ async fn fake_agent(mut peer: Channel, mut script: Script, log: Log) {
                             continue;
                         }
                     }
+                    "session/set_config_option" if script.config_hang => continue,
                     "session/set_config_option" => {
                         let (id, value) = (p["configId"].clone(), p["value"].clone());
                         if value == "bad" {
@@ -1161,4 +1164,50 @@ mod process {
             .unwrap();
         assert!(matches!(event, E::EngineExited { .. }), "{event:?}");
     }
+}
+
+/// 設定の当て直しに engine が答えなくても、会話は使える。確定の上限には数えない。
+#[tokio::test]
+async fn unanswered_config_reapply_does_not_stop_the_host() {
+    let script = Script {
+        config: config(),
+        config_hang: true,
+        turns: [Turn {
+            updates: vec![agent_text("ok")],
+            ..Turn::default()
+        }]
+        .into(),
+        ..Script::default()
+    };
+    let mut f = start(
+        vec![script],
+        HostOptions {
+            // 当て直しの打ち切りの方が、確定の上限より長い
+            establish_timeout: Duration::from_millis(100),
+            config_timeout: Duration::from_millis(300),
+            config_intent: vec![
+                ("model".into(), "b".into()),
+                ("thought_level".into(), "high".into()),
+            ],
+            ..HostOptions::default()
+        },
+    );
+    f.host.submit("hi", &[]).unwrap();
+    let events = f.until_turn_end().await;
+    assert!(
+        events.contains(&msg("ok")),
+        "打ち切った後に発話を送る: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, E::EngineExited { .. })),
+        "{events:?}"
+    );
+    let view = f.host.config_view().unwrap();
+    assert!(view.error.is_some(), "打ち切ったことを残す");
+    assert_eq!(view.options[0].current_value, "a");
+    assert_eq!(
+        f.params_of("session/set_config_option").len(),
+        1,
+        "答えが無ければ、残りの軸は送らずに打ち切る"
+    );
 }

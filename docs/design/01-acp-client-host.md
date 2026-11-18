@@ -130,9 +130,30 @@ VP に残すもの:
    - だから「開き直し」と「立て直し」で見える履歴の長さは変わらない（どちらも上限まで）
    - 実測で 3.4 MB / 12 turn の会話がある（大半は tool の結果）。1 件の大きさで切ると大きく減る見込みだが、値は実装で測って決める
 5. **待つ上限と失敗の返り**
-   - `history()` が会話の確定を待つのは、起動からの上限まで（`HostOptions::establish_timeout`、既定 30 秒。実測の load は 0.2 秒以内）。超えたら Err
+   - `history()` が会話の確定を待つのは、起動からの上限まで（`HostOptions::establish_timeout`、既定 30 秒。実測の確定は 2 秒ほど）。超えたら Err
+   - 確定は initialize と load / new まで。**設定の当て直しは確定の上限に数えない**。当て直しは全体で `config_timeout`（既定 15 秒）まで待ち、応答が無ければ残りの軸を送らずに打ち切る。失敗しても打ち切っても host は止めず、設定面に失敗の文を残して発話を流す（VP の手書きの host と同じ）。発話は当て直しが済むか打ち切られてから送る
    - load が失敗した時は、注入された方針に従う。`Fail`（既定）なら `history()` は engine の文を載せた Err を返し、host は終了する。`NewSession` なら新規の会話になり、`history()` は空を返す。新規に変えた事実は event で出す
    - `restart()` の失敗も同じ扱い
+
+#### 呼び手の規則
+
+- **他の書き手（console 等）が会話を進めたら、次の発話の前に `restart()` を呼ぶ**。呼ばずに発話を送ると、他の書き手の分が保存から消える
+- **`restart()` が `Busy` なら**、turn を中断するか終わりを待ってから呼び直す
+- **`restart()` が `Establish` / `Dead` を返したら、host は終了している**（`LoadFallback::Fail` で load に失敗した時、起動できなかった時など）。`EngineExited` も出る。その host はもう使えないので、呼び手が作り直す（`spawn` し直す）。`history()` / `submit()` も同じ Err を返す
+- **chat を開く時は `attach()`**。`history()` と `subscribe()` を別々に呼ばない
+- **`permission` と `on_session` に重い処理を置かない**（接続全体が止まる）
+
+#### load の流れの読み切り
+
+host は、`start_session()` が返った時点で stream に溜まっている分を「load が流した過去の会話」として読み切る（`read_update().now_or_never()` が None を返すまで）。「応答の前に届いた通知は、その時点で全部溜まっている」ことは、SDK の次の作りによる:
+
+- 接続ごとに dispatch loop が 1 本あり、届いた message を 1 件ずつ、届いた順に処理する（SDK `src/concepts/ordering.rs`「The Dispatch Loop」）。通知も応答も同じ loop を通る
+- `start_session()` は、session の振り分けを登録してから `session/load` を送る（`src/session.rs` の `start_restored_session`、`send_ordered_request_to_after`）。応答の前の通知は、loop が順に session の channel に入れる
+- 応答は `block_task_with_ordered_result` で受ける。応答の処理が済むまで loop は次へ進まない（`src/jsonrpc.rs`、「before releasing the ordered-response barrier」）。応答が処理される時には、それより前の通知は全部 channel に入っている
+
+応答の**後**の通知は、読み切りの時に届いていれば控えに、届いていなければ会話中の event になる。agy が応答の後に送るのは usage / commands / session_info（状態だけ）なので、どちらでも結果は同じ。
+
+実物で数を当てた結果は「実測の記録」の「大きい会話の load」。
 
 #### 流れの訳し方
 
@@ -190,8 +211,10 @@ pub enum LoadFallback { NewSession, Fail }
 pub struct HostOptions {
     pub resume: Option<String>,
     pub on_load_failed: LoadFallback,
-    /// 起動から会話の確定までの上限（既定 30 秒）
+    /// 起動から会話の確定（initialize と load / new）までの上限（既定 30 秒）
     pub establish_timeout: Duration,
+    /// 設定の応答を待つ上限（既定 15 秒）。当て直しは全体で、会話中の切替は 1 回ごと
+    pub config_timeout: Duration,
     /// spawn 後に当て直す (config id, 値)。agy は load の後に既定へ戻る（VP design 88 §6.1）
     pub config_intent: Vec<(String, String)>,
     pub permission: Arc<dyn Fn(&RequestPermissionRequest) -> PermissionDecision + Send + Sync>,
@@ -273,10 +296,10 @@ prompt の応答は `TurnCompleted` にする（context の使用量を載せる
 
 1. crate `crates/acp`（`agent-chat-acp`）。agent-chat の gate（fmt / clippy `-D warnings` / `test --all-features` / 生成物の drift）に乗っている
 2. calculations: 翻訳・設定・付随情報・permission・履歴の控え。fixture は VP design 88 §1・§6 の実測 wire（agy 1.5.9）と、今回の実測の形（agy 1.5.11）
-3. 偽の agent のテスト（`tests/fake_agent.rs`、26 本）
+3. 偽の agent のテスト（`tests/fake_agent.rs`、27 本）
    - 相手は SDK の `Channel::duplex()` の片側で、生の JSON-RPC を台本どおりに返す。SDK の `Agent.v1()` は使わなかった（load の応答の前後に通知を置く順序を、生の方が直接書ける）
-   - 場面: 新規の turn / load の流れが履歴になる / turn の最中の `history()` と中断 / 発話の写し / `restart()` / load の失敗（既定と新規）/ 待ちの上限 / 設定の当て直しと切替 / 知らない update / EOF / prompt の error / permission の方針 / 発話の順送りと画像 / `SessionInit` の保留 / 会話 ID の callback / 控えの上限 / 会話中に切り替えた設定が立て直しの後も残る / 立て直しの失敗 / 渡した関数の panic / `stop()` / 他の書き手の発話 / `attach()` / process の起動の失敗と stderr の末尾
-4. 実機 E2E（`tests/agy_e2e.rs`、`#[ignore]`、4 本）: agy 1.5.11、model は `gemini-3.8-flash`
+   - 場面: 新規の turn / load の流れが履歴になる / turn の最中の `history()` と中断 / 発話の写し / `restart()` / load の失敗（既定と新規）/ 待ちの上限 / 設定の当て直しと切替 / 知らない update / EOF / prompt の error / permission の方針 / 発話の順送りと画像 / `SessionInit` の保留 / 会話 ID の callback / 控えの上限 / 会話中に切り替えた設定が立て直しの後も残る / 立て直しの失敗 / 渡した関数の panic / `stop()` / 他の書き手の発話 / `attach()` / process の起動の失敗と stderr の末尾 / 設定の当て直しに答えない engine
+4. 実機 E2E（`tests/agy_e2e.rs`、`#[ignore]`、4 本 + 実物の会話を load して数える 1 本）: agy 1.5.11、model は `gemini-3.8-flash`
 5. VP の `AcpAgentHost` との比較（「VP の手書きの host との比較」の節）
 
 実機 E2E の回し方:
@@ -367,6 +390,7 @@ load の流れ（VP lead の実測）:
 
 ### リスク
 
+- **`serde_json` の `preserve_order`**: SDK（`agent-client-protocol` 5.3.0 と `agent-client-protocol-schema` 1.18.0）が有効にする（`cargo tree -e features -i serde_json` で確認）。feature は build 全体で 1 つにまとまるので、この crate に依存する binary では `serde_json::Value` の key の順が「辞書順」から「入れた順」に変わる。agent-chat の中では、protocol の fixture の key を辞書順に書いて生成物を変えないようにした。consumer への影響（JSON の文字列を比べている所）は Stage 2 の前に consumer 側で調べる
 - **SDK の版の追従**: 5.x で、schema は `=` で固定され、minor の版でも動く。unstable の feature は使わない。版は workspace の 1 か所で持つ
 - **境界**: process を共有側が持つ最初の host になる。load の失敗の扱いが、VP の今（黙って新規）と design 86（変換しない）で食い違う。方針を注入にして既定は `Fail`、VP は `NewSession` を渡す
 - **GFP**: crate を分けるので、GFP が依存するまで build に影響しない
@@ -393,3 +417,16 @@ load の流れ（VP lead の実測）:
 - 2 回測って同じ結果だった（load し直しを挟む場合と挟まない場合）
 - 会話中の turn に `user_message_chunk` は出なかった（1.5.9 の実測とは違う）
 - load の応答の configOptions の model は、切り替えた値のままだった（この測り方では既定に戻らなかった。既定が同じ model だったので、戻るかどうかは判定できていない）
+
+大きい会話の load（4924fbc2…、この host 経由、読むだけ。設定の当て直しはしていない）:
+
+| 控えの上限 | user | thinking | 本文 | ToolCall | ToolCallUpdate | 計 | 大きさ | truncated |
+|---|---|---|---|---|---|---|---|---|
+| なし | 12 | 63 | 15 | 147 | 147 | 384 | 3,464,343 bytes | false |
+| 既定（1 MiB / 800 件 / 1 件 32 KiB） | 12 | 63 | 15 | 147 | 147 | 384 | 1,037,291 bytes | true |
+
+- 流れの件数（user 12 / tool_call 147 / thought 63 / message 16）と合う。本文が 15 なのは、続いた 2 chunk を 1 件にまとめたため。`tool_call` 147 件は、結果まで入っているので `ToolCall` と `ToolCallUpdate` の 147 組になる
+- 確定の後 3 秒、受け口に出たのは `SessionInit` だけ。load の流れが会話中の event として漏れることは無かった
+- 既定の上限でも **12 turn が全部残った**。落ちたのは、1 件 32 KiB を超えた分の先頭だけ（tool の結果など）。それで 3.46 MB が 1.04 MB になった
+- ただし全体の上限（1,048,576 bytes）まで残り約 11 KB しか無い。この会話があと少し伸びると、古い turn から落ち始める
+- 起動から確定まで 1.7〜2.0 秒

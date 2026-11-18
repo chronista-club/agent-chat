@@ -426,3 +426,80 @@ async fn e2e_config_switch_and_image_prompt() {
     }
     host.stop();
 }
+
+/// 実物の大きい会話を load して、流れを全部控えに読み切れているかを数える（読むだけ）。
+///
+/// `ACP_E2E_LOAD_SESSION`（sessionId）と `ACP_E2E_LOAD_CWD`（その会話の cwd）を渡す。
+/// 設定の当て直しはしない（実物の会話の設定を動かさない）。
+#[tokio::test]
+#[ignore = "実機の agy と、load する実物の会話が要る"]
+async fn e2e_load_real_conversation_counts() {
+    let (Ok(session), Ok(cwd)) = (
+        std::env::var("ACP_E2E_LOAD_SESSION"),
+        std::env::var("ACP_E2E_LOAD_CWD"),
+    ) else {
+        println!("ACP_E2E_LOAD_SESSION / ACP_E2E_LOAD_CWD が無いので何もしない");
+        return;
+    };
+    let cwd = PathBuf::from(cwd);
+    let count = |events: &[E]| {
+        let n = |f: fn(&E) -> bool| events.iter().filter(|e| f(e)).count();
+        format!(
+            "U={} t={} A={} c={} u={} 計={}",
+            n(|e| matches!(e, E::UserMessage { .. })),
+            n(|e| matches!(e, E::ThoughtChunk { .. })),
+            n(|e| matches!(e, E::MessageChunk { .. })),
+            n(|e| matches!(e, E::ToolCall { .. })),
+            n(|e| matches!(e, E::ToolCallUpdate { .. })),
+            events.len()
+        )
+    };
+    let bytes = |events: &[E]| -> usize {
+        events
+            .iter()
+            .map(|e| serde_json::to_vec(e).map_or(0, |v| v.len()))
+            .sum()
+    };
+    for (label, limits) in [
+        (
+            "上限なし",
+            agent_chat_acp::HistoryLimits {
+                max_bytes: usize::MAX,
+                max_events: usize::MAX,
+                max_item_bytes: usize::MAX,
+            },
+        ),
+        ("既定の上限", agent_chat_acp::HistoryLimits::default()),
+    ] {
+        let host = AcpClientHost::spawn(
+            launch(&cwd, true),
+            HostOptions {
+                resume: Some(session.clone()),
+                history_limits: limits,
+                ..HostOptions::default()
+            },
+        )
+        .expect("起動");
+        let started = Instant::now();
+        let (history, mut later) = host.attach().await.expect("load");
+        println!(
+            "{label}: {} / {} bytes / truncated={} / 確定まで {:?}",
+            count(&history.events),
+            bytes(&history.events),
+            history.truncated,
+            started.elapsed()
+        );
+        // 読み切れていなければ、残りが会話中の event として受け口に出る
+        let mut leaked = Vec::new();
+        while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_secs(3), later.recv()).await {
+            leaked.push(event);
+        }
+        println!("{label}: 確定の後に受け口に出た event: {}", kinds(&leaked));
+        assert!(
+            leaked.iter().all(|e| matches!(e, E::SessionInit { .. })),
+            "load の流れが会話中の event として漏れている: {}",
+            kinds(&leaked)
+        );
+        host.stop();
+    }
+}

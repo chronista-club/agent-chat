@@ -39,8 +39,6 @@ use crate::session_meta::{
 };
 use crate::translate::AcpTranslator;
 
-/// `set_config_option` の応答を待つ上限（1 軸）。agy の実測の応答は 0.1 秒ほど。
-const CONFIG_SET_TIMEOUT: Duration = Duration::from_secs(15);
 /// 保持する stderr の末尾の大きさ。
 const STDERR_TAIL_BYTES: usize = 4096;
 const EVENT_CAPACITY: usize = 1024;
@@ -80,6 +78,9 @@ pub struct HostOptions {
     pub on_load_failed: LoadFallback,
     /// 起動から会話の確定までの上限。
     pub establish_timeout: Duration,
+    /// 設定の応答を待つ上限。当て直しは全体でこの時間まで、会話中の切替は 1 回ごと。
+    /// 超えても host は止めず、設定面に失敗の文を残す。agy の実測の応答は 0.1 秒ほど。
+    pub config_timeout: Duration,
     /// 会話の確定の後に当て直す `(config id, 値)`。agy は load の後に既定へ戻る。
     pub config_intent: Vec<(String, String)>,
     /// permission の要求への答え方。重い処理をしない（接続全体が止まる）。
@@ -95,6 +96,7 @@ impl Default for HostOptions {
             resume: None,
             on_load_failed: LoadFallback::default(),
             establish_timeout: Duration::from_secs(30),
+            config_timeout: Duration::from_secs(15),
             config_intent: Vec::new(),
             permission: Arc::new(permission::allow),
             on_session: Arc::new(|_| Ok(())),
@@ -409,7 +411,7 @@ impl AcpClientHost {
             value: value.to_string(),
             reply,
         })?;
-        match tokio::time::timeout(CONFIG_SET_TIMEOUT, rx).await {
+        match tokio::time::timeout(self.ctx.options.config_timeout, rx).await {
             Ok(result) => result.map_err(|_| self.dead())?,
             Err(_) => Err(HostError::Engine(
                 "設定の切替の応答がありません".to_string(),
@@ -622,7 +624,13 @@ async fn run_connection(
                     )));
                 }
             };
+            // 会話はここで確定。設定の当て直しは確定の上限に数えない（遅くても失敗しても
+            // host は止めず、設定面に失敗の文を残して発話を流す）。発話は当て直しの後に送る。
             ctx.phase.send_replace(Phase::Ready);
+            reapply_config(&cx, ctx, &conn.session_id).await;
+            if let Some(init) = ctx.build_session_init() {
+                ctx.emit(init);
+            }
             if let Some(reply) = restarting.take() {
                 let _ = reply.send(Ok(ctx.snapshot()));
             }
@@ -736,16 +744,15 @@ async fn establish(
             message: format!("会話 ID を保存できません: {e}"),
         });
     }
-    reapply_config(cx, ctx, &session_id).await;
-    if let Some(init) = ctx.build_session_init() {
-        ctx.emit(init);
-    }
     Ok(conn)
 }
 
 /// 呼び手の意図を 1 軸ずつ当て直す。直前の応答で更新した設定面で要否を決める。
 async fn reapply_config(cx: &ConnectionTo<Agent>, ctx: &Arc<Ctx>, session_id: &str) {
     let intent = ctx.shared().intent.clone();
+    ctx.shared().config_error = None;
+    // 全体で `config_timeout` まで。応答が無ければ残りの軸は送らずに打ち切る。
+    let deadline = tokio::time::Instant::now() + ctx.options.config_timeout;
     for (id, value) in &intent {
         let needed = ctx
             .shared()
@@ -760,20 +767,21 @@ async fn reapply_config(cx: &ConnectionTo<Agent>, ctx: &Arc<Ctx>, session_id: &s
             SessionConfigId::new(id.as_str()),
             value.as_str(),
         );
-        let result =
-            tokio::time::timeout(CONFIG_SET_TIMEOUT, cx.send_request(request).block_task()).await;
+        let result = tokio::time::timeout_at(deadline, cx.send_request(request).block_task()).await;
         let mut shared = ctx.shared();
         match result {
             Ok(Ok(response)) => {
                 let value = serde_json::to_value(&response.config_options).unwrap_or_default();
                 shared.config = parse_config_options(&value);
-                shared.config_error = None;
                 if let Some(model) = current_model(shared.config.as_deref()) {
                     shared.model = Some(model);
                 }
             }
             Ok(Err(e)) => shared.config_error = Some(format!("{id}={value}: {e}")),
-            Err(_) => shared.config_error = Some(format!("{id}={value}: 応答がありません")),
+            Err(_) => {
+                shared.config_error = Some(format!("{id}={value}: 応答がありません"));
+                break;
+            }
         }
     }
 }
