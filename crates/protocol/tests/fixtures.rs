@@ -192,7 +192,10 @@ fn fixtures() -> Vec<(&'static str, ConversationEvent)> {
             ConversationEvent::ToolCall {
                 id: "toolu_01".into(),
                 name: "Bash".into(),
-                input: serde_json::json!({"command": "ls", "timeout": 1000, "nested": {"a": [1, 2]}}),
+                // key は辞書順に書く。serde_json の `preserve_order` は workspace の他の crate
+                // （agent-chat-acp の SDK）が有効にすることがあり、その時は書いた順で出る。
+                // 辞書順にしておけば、feature の有無で生成物が変わらない。
+                input: serde_json::json!({"command": "ls", "nested": {"a": [1, 2]}, "timeout": 1000}),
             },
         ),
         (

@@ -845,7 +845,7 @@ async fn queued_prompts_go_one_at_a_time_with_images() {
     );
 }
 
-/// turn の最中に slash command が変わったら、`SessionInit` は turn の終わりに出し直す。
+/// turn の最中に slash command が変わったら、`SessionInit` は turn の終わり（`TurnCompleted` の直前）に出し直す。
 #[tokio::test]
 async fn session_init_refresh_waits_for_turn_end() {
     let turn = Turn {
@@ -863,13 +863,18 @@ async fn session_init_refresh_waits_for_turn_end() {
         HostOptions::default(),
     );
     f.host.submit("hi", &[]).unwrap();
-    f.until_turn_end().await;
-    let after = f.until(|e| matches!(e, E::SessionInit { .. })).await;
-    assert!(
-        matches!(&after[0], E::SessionInit { slash_commands, .. } if slash_commands == &["goal"]),
-        "{after:?}"
+    let events = f.until_turn_end().await;
+    let n = events.len();
+    assert_eq!(
+        events[n - 3],
+        msg("x"),
+        "turn の途中では出し直さない: {events:?}"
     );
-    assert_eq!(f.host.session_init().as_ref(), Some(&after[0]));
+    assert!(
+        matches!(&events[n - 2], E::SessionInit { slash_commands, .. } if slash_commands == &["goal"]),
+        "{events:?}"
+    );
+    assert_eq!(f.host.session_init().as_ref(), Some(&events[n - 2]));
 }
 
 #[tokio::test]
@@ -921,4 +926,239 @@ async fn history_limits_apply_to_the_load_stream() {
     let history = f.host.history().await.unwrap();
     assert_eq!(history.events, [user("2"), msg("b"), user("3"), msg("c")]);
     assert!(history.truncated);
+}
+
+/// 会話中に切り替えた設定は、立て直しの後も保つ（起動の時の意図に戻さない）。
+#[tokio::test]
+async fn config_chosen_mid_conversation_survives_restart() {
+    let script = || Script {
+        config: config(),
+        ..Script::default()
+    };
+    let mut f = start(
+        vec![script(), script()],
+        HostOptions {
+            config_intent: vec![("model".into(), "a".into())],
+            ..HostOptions::default()
+        },
+    );
+    f.until(|e| matches!(e, E::SessionInit { .. })).await;
+    f.host.set_config("model", "b").await.unwrap();
+    f.host.set_config("thought_level", "high").await.unwrap();
+
+    // 立て直した engine は既定（model=a, thought_level=low）に戻っている
+    f.host.restart().await.unwrap();
+    let view = f.host.config_view().unwrap();
+    assert_eq!(
+        view.options
+            .iter()
+            .map(|o| o.current_value.as_str())
+            .collect::<Vec<_>>(),
+        ["b", "high"],
+        "利用者が選んだ値に当て直す"
+    );
+    let sets = f.params_of("session/set_config_option");
+    assert_eq!(sets.len(), 4, "{sets:?}");
+    assert_eq!(
+        (&sets[2]["configId"], &sets[2]["value"]),
+        (&json!("model"), &json!("b"))
+    );
+    assert_eq!(
+        (&sets[3]["configId"], &sets[3]["value"]),
+        (&json!("thought_level"), &json!("high"))
+    );
+}
+
+/// 立て直しが失敗したら、`restart()` も `history()` も Err。終了を event で出す。
+#[tokio::test]
+async fn failed_restart_is_reported_everywhere() {
+    let mut f = start(
+        vec![
+            Script::default(),
+            Script {
+                load_error: true,
+                ..Script::default()
+            },
+        ],
+        HostOptions::default(),
+    );
+    f.until(|e| matches!(e, E::SessionInit { .. })).await;
+    let error = f.host.restart().await.unwrap_err();
+    assert!(matches!(error, HostError::Establish(_)), "{error:?}");
+    assert_eq!(f.host.history().await, Err(error));
+    f.until(|e| matches!(e, E::EngineExited { .. })).await;
+}
+
+/// アプリが渡した関数が panic しても、待っている呼び手は Err を受け取る（永久に待たない）。
+#[tokio::test]
+async fn panic_in_injected_callback_does_not_hang_callers() {
+    let mut f = start(
+        vec![Script::default()],
+        HostOptions {
+            on_session: Arc::new(|_| panic!("アプリの callback の不具合")),
+            ..HostOptions::default()
+        },
+    );
+    let result = tokio::time::timeout(WAIT, f.host.history())
+        .await
+        .expect("history() が返る");
+    assert!(matches!(result, Err(HostError::Dead(_))), "{result:?}");
+    f.until(|e| matches!(e, E::EngineExited { .. })).await;
+    assert!(f.host.session_init().is_none(), "poison された後も読める");
+}
+
+/// `stop()` は終了の event を出さず、その後の呼び出しは Err。
+#[tokio::test]
+async fn stop_is_quiet_and_final() {
+    let mut f = start(vec![Script::default()], HostOptions::default());
+    f.until(|e| matches!(e, E::SessionInit { .. })).await;
+    f.host.stop();
+    assert!(matches!(
+        f.host.history().await,
+        Ok(_) | Err(HostError::Dead(_))
+    ));
+    tokio::time::timeout(WAIT, async {
+        while f.host.submit("x", &[]).is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("停止の後の submit は Err");
+    assert!(matches!(f.host.history().await, Err(HostError::Dead(_))));
+    while let Ok(event) = f.events.try_recv() {
+        assert!(
+            !matches!(event, E::EngineExited { .. }),
+            "止めただけで終了の event は出さない"
+        );
+    }
+}
+
+/// host が prompt を出していない時に来た user の発話は、他の書き手の分として出す。
+#[tokio::test]
+async fn user_message_outside_own_turn_is_broadcast() {
+    let script = Script {
+        after_load: vec![user_text("他の書き手から"), agent_text("答え")],
+        ..Script::default()
+    };
+    let mut f = start(vec![script], resume("s-1"));
+    let events = f.until(|e| matches!(e, E::MessageChunk { .. })).await;
+    assert!(events.contains(&user("他の書き手から")), "{events:?}");
+    assert_eq!(
+        f.host.history().await.unwrap().events,
+        [user("他の書き手から"), msg("答え")]
+    );
+}
+
+/// turn の最中に開き直す: 控えと、その続きの受け口を一緒に取る。抜けも重なりも無い。
+#[tokio::test]
+async fn attach_returns_history_and_only_later_events() {
+    let turn = Turn {
+        updates: vec![agent_text("前")],
+        wait_cancel: true,
+        ..Turn::default()
+    };
+    let mut f = start(
+        vec![Script {
+            turns: [turn].into(),
+            ..Script::default()
+        }],
+        HostOptions::default(),
+    );
+    f.host.submit("hi", &[]).unwrap();
+    f.until(|e| matches!(e, E::MessageChunk { .. })).await;
+    let (history, mut later) = f.host.attach().await.unwrap();
+    assert_eq!(history.events, [user("hi"), msg("前")]);
+    assert!(history.in_flight);
+    f.host.interrupt().unwrap();
+    let next = tokio::time::timeout(WAIT, later.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(next, E::TurnCompleted { .. }),
+        "控えに入った分は受け口に出ない: {next:?}"
+    );
+}
+
+/// 送ったばかりで応答がまだ何も無い turn の最中も、立て直さない。
+#[tokio::test]
+async fn restart_is_busy_while_a_turn_is_queued() {
+    let turns = [Turn {
+        wait_cancel: true,
+        ..Turn::default()
+    }];
+    let mut f = start(
+        vec![Script {
+            turns: turns.into(),
+            ..Script::default()
+        }],
+        HostOptions::default(),
+    );
+    f.until(|e| matches!(e, E::SessionInit { .. })).await;
+    f.host.submit("a", &[]).unwrap();
+    assert_eq!(f.host.restart().await, Err(HostError::Busy));
+    f.host.interrupt().unwrap();
+    f.until_turn_end().await;
+}
+
+#[cfg(unix)]
+mod process {
+    use super::*;
+    use agent_chat_acp::LaunchContext;
+
+    fn sh(script: &str) -> LaunchContext {
+        LaunchContext {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), script.into()],
+            cwd: std::env::temp_dir(),
+            env: vec![("ACP_TEST_ADDED".into(), "yes".into())],
+            env_remove: vec!["ACP_TEST_REMOVED".into()],
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_program_is_a_spawn_error() {
+        let launch = LaunchContext {
+            program: PathBuf::from("/no/such/acp-engine"),
+            ..sh("")
+        };
+        let error = AcpClientHost::spawn(launch, HostOptions::default())
+            .err()
+            .expect("起動の失敗");
+        assert!(
+            matches!(&error, HostError::Spawn(m) if m.contains("/no/such/acp-engine")),
+            "{error:?}"
+        );
+    }
+
+    /// engine がすぐ終了したら、stderr の末尾を添えて知らせる。cwd と env も渡っている。
+    #[tokio::test]
+    async fn early_exit_reports_stderr_tail_with_launch_context() {
+        // SAFETY: この test だけが触る名前。子 process に継承されないことを確かめるために置く。
+        unsafe { std::env::set_var("ACP_TEST_REMOVED", "leak") };
+        let host = AcpClientHost::spawn(
+            sh("echo \"cwd=$(pwd -P) added=$ACP_TEST_ADDED removed=${ACP_TEST_REMOVED:-none}\" >&2; exit 3"),
+            HostOptions::default(),
+        )
+        .expect("起動");
+        let mut events = host.subscribe();
+        let error = tokio::time::timeout(WAIT, host.history())
+            .await
+            .unwrap()
+            .unwrap_err();
+        let HostError::Establish(message) = &error else {
+            panic!("{error:?}")
+        };
+        let cwd = std::env::temp_dir().canonicalize().unwrap();
+        assert!(
+            message.contains(&format!("cwd={}", cwd.display())),
+            "{message}"
+        );
+        assert!(message.contains("added=yes removed=none"), "{message}");
+        let event = tokio::time::timeout(WAIT, events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, E::EngineExited { .. }), "{event:?}");
+    }
 }

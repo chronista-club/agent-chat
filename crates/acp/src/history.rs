@@ -43,7 +43,16 @@ pub struct HistorySnapshot {
 #[derive(Debug, Default)]
 struct Turn {
     events: Vec<ConversationEvent>,
+    /// `events` と同じ並びの、各 event の勘定済みの大きさ（JSON の byte 数）。
+    sizes: Vec<usize>,
     bytes: usize,
+}
+
+/// 勘定に使う大きさ = JSON にした時の byte 数（呼び手に渡る形）。
+fn json_len(event: &ConversationEvent) -> usize {
+    serde_json::to_vec(event)
+        .expect("ConversationEvent は serialize できる")
+        .len()
 }
 
 #[derive(Debug)]
@@ -92,11 +101,10 @@ impl History {
         if matches!(event, E::UserMessage { .. }) || self.turns.is_empty() {
             self.turns.push_back(Turn::default());
         }
-        let bytes = serde_json::to_vec(&event)
-            .expect("ConversationEvent は serialize できる")
-            .len();
+        let bytes = json_len(&event);
         let turn = self.turns.back_mut().expect("直前に足した");
         turn.events.push(event);
+        turn.sizes.push(bytes);
         turn.bytes += bytes;
         self.bytes += bytes;
         self.events += 1;
@@ -110,17 +118,23 @@ impl History {
         let Some(turn) = self.turns.back_mut() else {
             return false;
         };
-        let (kept, add) = match (turn.events.last_mut(), event) {
-            (Some(E::MessageChunk { text: kept }), E::MessageChunk { text })
-            | (Some(E::ThoughtChunk { text: kept }), E::ThoughtChunk { text }) => (kept, text),
+        let Some(last) = turn.events.last_mut() else {
+            return false;
+        };
+        let cut = match (&mut *last, event) {
+            (E::MessageChunk { text: kept }, E::MessageChunk { text })
+            | (E::ThoughtChunk { text: kept }, E::ThoughtChunk { text }) => {
+                kept.push_str(text);
+                trim_text(kept, max)
+            }
             _ => return false,
         };
-        let before = kept.len();
-        kept.push_str(add);
-        let cut = trim_text(kept, max);
-        let after = kept.len();
-        turn.bytes = turn.bytes + after - before;
-        self.bytes = self.bytes + after - before;
+        // まとめた後の 1 件を数え直す（生の長さの差では、改行や引用符の分がずれる）。
+        let after = json_len(last);
+        let size = turn.sizes.last_mut().expect("events と同じ長さ");
+        turn.bytes = turn.bytes - *size + after;
+        self.bytes = self.bytes - *size + after;
+        *size = after;
         self.truncated |= cut;
         self.enforce();
         true
@@ -138,10 +152,8 @@ impl History {
                 let Some(turn) = self.turns.front_mut().filter(|t| t.events.len() > 1) else {
                     break;
                 };
-                let old = turn.events.remove(0);
-                let bytes = serde_json::to_vec(&old)
-                    .expect("ConversationEvent は serialize できる")
-                    .len();
+                turn.events.remove(0);
+                let bytes = turn.sizes.remove(0);
                 turn.bytes -= bytes;
                 self.bytes -= bytes;
                 self.events -= 1;
@@ -396,5 +408,45 @@ mod tests {
         h.push(msg("a"));
         h.push(user("q"));
         assert_eq!(h.snapshot(false).events, vec![msg("a"), user("q")]);
+    }
+
+    /// 改行や引用符は JSON にすると長くなる。まとめた chunk も JSON の長さで数える
+    /// （生の長さで足して JSON の長さで引くと、勘定が負になる）。
+    #[test]
+    fn merged_chunks_with_escapes_are_counted_as_json() {
+        let limits = HistoryLimits {
+            max_events: 2,
+            ..HistoryLimits::default()
+        };
+        let mut h = History::new(limits);
+        h.push(user("q"));
+        h.push(msg("a"));
+        h.push(msg(&"\n".repeat(1000)));
+        h.push(call("t1"));
+        h.push(call("t2"));
+        assert_eq!(h.snapshot(false).events, vec![call("t1"), call("t2")]);
+    }
+
+    #[test]
+    fn byte_limit_holds_for_one_long_turn_full_of_escapes() {
+        let limits = HistoryLimits {
+            max_bytes: 4096,
+            ..HistoryLimits::default()
+        };
+        let mut h = History::new(limits);
+        h.push(user("q"));
+        for i in 0..300 {
+            h.push(msg("line\n\"quoted\"\n"));
+            h.push(msg("more\\\n"));
+            h.push(call(&format!("t{i}")));
+        }
+        let snap = h.snapshot(false);
+        let size: usize = snap
+            .events
+            .iter()
+            .map(|e| serde_json::to_vec(e).unwrap().len())
+            .sum();
+        assert!(size <= 4096, "{size}");
+        assert!(snap.truncated && !snap.events.is_empty());
     }
 }

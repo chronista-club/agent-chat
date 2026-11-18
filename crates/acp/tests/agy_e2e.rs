@@ -9,7 +9,7 @@
 //! model は `gemini-3.8-flash`（枠は model ごとに別。既定の model は枠が切れていることがある）。
 //! 各テストは試験用の会話を agy に 1 つ作る（cwd は temp の下）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,7 +31,7 @@ fn workdir(name: &str) -> PathBuf {
     dir.canonicalize().expect("絶対 path")
 }
 
-fn launch(cwd: &PathBuf, skip_permissions: bool) -> LaunchContext {
+fn launch(cwd: &Path, skip_permissions: bool) -> LaunchContext {
     let mut args = vec!["acp".to_string()];
     if skip_permissions {
         args.push("--dangerously-skip-permissions".to_string());
@@ -39,7 +39,7 @@ fn launch(cwd: &PathBuf, skip_permissions: bool) -> LaunchContext {
     LaunchContext {
         program: PathBuf::from(std::env::var("AGY_BIN").unwrap_or_else(|_| "agy".to_string())),
         args,
-        cwd: cwd.clone(),
+        cwd: cwd.to_path_buf(),
         env: Vec::new(),
         env_remove: Vec::new(),
     }

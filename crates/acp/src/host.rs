@@ -245,6 +245,9 @@ struct Shared {
     command_docs: HashMap<String, String>,
     config: Option<Vec<AcpConfigOption>>,
     config_error: Option<String>,
+    /// 今の設定の意図 `(config id, 値)`。初めは `HostOptions::config_intent`、会話中の切替が
+    /// 成功したら上書きする。立て直しの後の当て直しはここから読む。
+    intent: Vec<(String, String)>,
     /// `(使用中の token, window)`。
     usage: Option<(u64, u64)>,
     history: History,
@@ -267,7 +270,10 @@ impl Ctx {
     }
 
     fn shared(&self) -> std::sync::MutexGuard<'_, Shared> {
-        self.shared.lock().expect("acp shared lock")
+        // 他の thread が panic して poison されても、状態は読める形で残っている。
+        self.shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// 今の状態から `SessionInit` を組んで覚える。sessionId が無ければ None。
@@ -357,6 +363,7 @@ impl AcpClientHost {
                 command_docs: HashMap::new(),
                 config: None,
                 config_error: None,
+                intent: options.config_intent.clone(),
                 usage: None,
                 history: History::new(options.history_limits),
                 in_turn: false,
@@ -424,16 +431,41 @@ impl AcpClientHost {
     }
 
     /// 履歴の控え。会話の確定まで待つ。呼び手が `ReplayStart` 〜 `ReplayEnd` で包む。
+    ///
+    /// 続きの event も受けるなら [`Self::attach`] を使う（控えと購読の間で抜けや重なりが出ない）。
     pub async fn history(&self) -> Result<HistorySnapshot, HostError> {
+        self.attach().await.map(|(history, _)| history)
+    }
+
+    /// 履歴の控えと、その続きの event の受け口を一緒に取る。
+    ///
+    /// 控えに入った event は受け口には出ず、控えに無い event は必ず受け口に出る。turn の最中に
+    /// chat を開き直す時に使う。
+    pub async fn attach(
+        &self,
+    ) -> Result<(HistorySnapshot, broadcast::Receiver<ConversationEvent>), HostError> {
         let mut phase = self.ctx.phase.subscribe();
-        let settled = phase
-            .wait_for(|p| !matches!(p, Phase::Starting))
-            .await
-            .map_err(|_| self.dead())?
-            .clone();
-        match settled {
-            Phase::Failed(error) => Err(error),
-            _ => Ok(self.ctx.snapshot()),
+        loop {
+            let settled = phase
+                .wait_for(|p| !matches!(p, Phase::Starting))
+                .await
+                .map_err(|_| self.dead())?
+                .clone();
+            if let Phase::Failed(error) = settled {
+                return Err(error);
+            }
+            // 控えへの追加と event の送信は同じ lock の中で行われるので、ここで揃う。
+            let shared = self.ctx.shared();
+            let attached = (
+                shared.history.snapshot(shared.in_turn),
+                self.ctx.events.subscribe(),
+            );
+            drop(shared);
+            // 取っている間に立て直しが始まっていたら、新しい控えを待ち直す
+            // （立て直しは、控えを空にする前に Starting にする）。
+            if matches!(*self.ctx.phase.borrow(), Phase::Ready) {
+                return Ok(attached);
+            }
         }
     }
 
@@ -478,6 +510,23 @@ async fn supervise<C: Connector>(
     ctx: Arc<Ctx>,
     mut commands: mpsc::UnboundedReceiver<Command>,
 ) {
+    // この task が panic で落ちても、待っている呼び手が永久に待たないようにする。
+    struct Guard(Arc<Ctx>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if matches!(*self.0.phase.borrow(), Phase::Failed(_)) {
+                return;
+            }
+            let error = HostError::Dead("host の task が異常終了しました".to_string());
+            self.0.shared().in_turn = false;
+            self.0.emit(ConversationEvent::EngineExited {
+                message: error.to_string(),
+            });
+            self.0.phase.send_replace(Phase::Failed(error));
+        }
+    }
+    let _guard = Guard(Arc::clone(&ctx));
+
     let mut resume = ctx.options.resume.clone();
     let mut transport = Some(first);
     let mut restarting: Option<Reply<HistorySnapshot>> = None;
@@ -498,12 +547,13 @@ async fn supervise<C: Connector>(
         connector.shutdown();
         let error = match exit {
             Exit::Restart(reply) => {
+                // 先に Starting にする。控えを空にした後で Ready のまま読まれないように。
+                ctx.phase.send_replace(Phase::Starting);
                 let mut shared = ctx.shared();
                 resume = shared.session_id.clone();
                 shared.history = History::new(ctx.options.history_limits);
                 shared.in_turn = false;
                 drop(shared);
-                ctx.phase.send_replace(Phase::Starting);
                 restarting = Some(reply);
                 continue;
             }
@@ -595,6 +645,8 @@ struct Connection {
 
 /// 設定の切替の応答（接続の task から命令のループへ戻す）。
 struct ConfigSet {
+    id: String,
+    value: String,
     reply: Reply<Vec<AcpConfigOption>>,
     result: Result<Vec<AcpConfigOption>, String>,
 }
@@ -693,7 +745,8 @@ async fn establish(
 
 /// 呼び手の意図を 1 軸ずつ当て直す。直前の応答で更新した設定面で要否を決める。
 async fn reapply_config(cx: &ConnectionTo<Agent>, ctx: &Arc<Ctx>, session_id: &str) {
-    for (id, value) in &ctx.options.config_intent {
+    let intent = ctx.shared().intent.clone();
+    for (id, value) in &intent {
         let needed = ctx
             .shared()
             .config
@@ -741,6 +794,8 @@ impl Connection {
         commands: &mut mpsc::UnboundedReceiver<Command>,
     ) -> Exit {
         let (config_tx, mut config_rx) = mpsc::unbounded_channel::<ConfigSet>();
+        // 応答を待っている設定の切替の数。待ちがある間は立て直さない（結果が分からなくなる）。
+        let mut config_pending = 0usize;
         loop {
             tokio::select! {
                 // engine からの流れを先に読み切る（EOF より前に届いた分を落とさない）。
@@ -750,9 +805,15 @@ impl Connection {
                     Err(e) => return Exit::Dead(e.to_string()),
                 },
                 Some(done) = config_rx.recv() => {
+                    config_pending = config_pending.saturating_sub(1);
                     let mut shared = ctx.shared();
                     match &done.result {
                         Ok(options) => {
+                            // 利用者が選んだ値を今の意図にする。立て直しの後もこの値に当て直す。
+                            match shared.intent.iter_mut().find(|(id, _)| *id == done.id) {
+                                Some(entry) => entry.1 = done.value.clone(),
+                                None => shared.intent.push((done.id.clone(), done.value.clone())),
+                            }
                             shared.config = Some(options.clone());
                             shared.config_error = None;
                             if let Some(model) = current_model(Some(options)) {
@@ -797,16 +858,17 @@ impl Connection {
                                         parse_config_options(&value).unwrap_or_default()
                                     })
                                     .map_err(|e| format!("{id}={value}: {e}"));
-                                let _ = config_tx.send(ConfigSet { reply, result });
+                                let _ = config_tx.send(ConfigSet { id, value, reply, result });
                                 Ok(())
                             },
                         );
                         if let Err(e) = sent {
                             return Exit::Dead(e.to_string());
                         }
+                        config_pending += 1;
                     }
                     Some(Command::Restart { reply }) => {
-                        if self.in_turn || !self.queue.is_empty() {
+                        if self.in_turn || !self.queue.is_empty() || config_pending > 0 {
                             let _ = reply.send(Err(HostError::Busy));
                         } else {
                             return Exit::Restart(reply);
@@ -907,7 +969,9 @@ impl Connection {
             if self.in_turn && matches!(event, ConversationEvent::UserMessage { .. }) {
                 continue;
             }
-            ctx.shared().history.push(event.clone());
+            // 控えへの追加と送信を同じ lock の中で行う（`attach` が抜けも重なりも無く取れる）。
+            let mut shared = ctx.shared();
+            shared.history.push(event.clone());
             ctx.emit(event);
         }
     }
@@ -935,22 +999,24 @@ impl Connection {
             });
         }
         self.in_turn = false;
-        let usage = {
-            let mut shared = ctx.shared();
-            shared.in_turn = false;
-            shared.usage
-        };
+        // 保留した SessionInit は TurnCompleted の前に出す（VP の手書きの host と同じ並び）。
+        if std::mem::take(&mut self.init_deferred)
+            && let Some(init) = ctx.build_session_init()
+        {
+            ctx.emit(init);
+        }
+        // in_turn を下ろすのと TurnCompleted の送信を同じ lock の中で行う
+        // （`attach` の in_flight と、受け口に出る TurnCompleted が食い違わない）。
+        let mut shared = ctx.shared();
+        shared.in_turn = false;
+        let usage = shared.usage;
         ctx.emit(ConversationEvent::TurnCompleted {
             session_id: self.session_id.clone(),
             cost_usd: None,
             context_tokens: usage.map(|(used, _)| used),
             context_window: usage.map(|(_, size)| size),
         });
-        if std::mem::take(&mut self.init_deferred)
-            && let Some(init) = ctx.build_session_init()
-        {
-            ctx.emit(init);
-        }
+        drop(shared);
         if let Err(message) = self.send_next(ctx) {
             ctx.emit(ConversationEvent::Error { message });
         }

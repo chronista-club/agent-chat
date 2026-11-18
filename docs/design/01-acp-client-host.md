@@ -171,6 +171,10 @@ VP の `AcpAgentHost` に近い形にして、Stage 2 の差し替えを小さ�
 - 失敗は `HostError`（`Spawn` / `Establish` / `Dead` / `Busy` / `Engine`）
 - `spawn_with(connector, cwd, options)`: 接続の作り方（`Connector`）を差し替える口。既定は process の起動。テストは偽の agent をつなぐ。`restart()` はこの口をもう一度呼ぶ
 - permission の既定の方針は `permission::allow`（kind で allow_once → allow_always、無ければ取り消し）
+- `attach()`: 控えへの追加と event の送信を同じ lock の中で行うので、控えに入った event は受け口に出ず、控えに無い event は必ず受け口に出る。`history()` と `subscribe()` を別々に呼ぶと、その間の event が重なるか抜ける
+- 設定の意図: 会話中の `set_config` が成功したら、その値を今の意図として覚える。`restart()` の後の当て直しは今の意図から行う（起動の時の `config_intent` に戻さない）
+- `restart()` が `Busy` を返すのは、turn の最中・送っていない発話がある時・設定の切替の応答を待っている時
+- アプリが渡した関数（`on_session` / `permission`）が panic して host の task が落ちても、待っている呼び手は `Dead` を受け取り、`EngineExited` が出る
 
 ```rust
 pub struct LaunchContext {
@@ -208,6 +212,8 @@ impl AcpClientHost {
     pub fn session_init(&self) -> Option<ConversationEvent>;
     /// 履歴の控え。会話の確定まで待つ。呼び手が ReplayStart 〜 ReplayEnd で包む
     pub async fn history(&self) -> Result<HistorySnapshot>;
+    /// 控えと、その続きの event の受け口を一緒に取る（turn の最中に開き直す時）
+    pub async fn attach(&self) -> Result<(HistorySnapshot, broadcast::Receiver<ConversationEvent>)>;
     /// process を立て直して load し直す。他の書き手が会話を進めた後、次の prompt の前に呼ぶ。turn の最中は Err
     pub async fn restart(&self) -> Result<HistorySnapshot>;
     pub fn stop(&self);
@@ -267,9 +273,9 @@ prompt の応答は `TurnCompleted` にする（context の使用量を載せる
 
 1. crate `crates/acp`（`agent-chat-acp`）。agent-chat の gate（fmt / clippy `-D warnings` / `test --all-features` / 生成物の drift）に乗っている
 2. calculations: 翻訳・設定・付随情報・permission・履歴の控え。fixture は VP design 88 §1・§6 の実測 wire（agy 1.5.9）と、今回の実測の形（agy 1.5.11）
-3. 偽の agent のテスト（`tests/fake_agent.rs`、17 の場面）
+3. 偽の agent のテスト（`tests/fake_agent.rs`、26 本）
    - 相手は SDK の `Channel::duplex()` の片側で、生の JSON-RPC を台本どおりに返す。SDK の `Agent.v1()` は使わなかった（load の応答の前後に通知を置く順序を、生の方が直接書ける）
-   - 場面: 新規の turn / load の流れが履歴になる / turn の最中の `history()` と中断 / 発話の写し / `restart()` / load の失敗（既定と新規）/ 待ちの上限 / 設定の当て直しと切替 / 知らない update / EOF / prompt の error / permission の方針 / 発話の順送りと画像 / `SessionInit` の保留 / 会話 ID の callback / 控えの上限
+   - 場面: 新規の turn / load の流れが履歴になる / turn の最中の `history()` と中断 / 発話の写し / `restart()` / load の失敗（既定と新規）/ 待ちの上限 / 設定の当て直しと切替 / 知らない update / EOF / prompt の error / permission の方針 / 発話の順送りと画像 / `SessionInit` の保留 / 会話 ID の callback / 控えの上限 / 会話中に切り替えた設定が立て直しの後も残る / 立て直しの失敗 / 渡した関数の panic / `stop()` / 他の書き手の発話 / `attach()` / process の起動の失敗と stderr の末尾
 4. 実機 E2E（`tests/agy_e2e.rs`、`#[ignore]`、4 本）: agy 1.5.11、model は `gemini-3.8-flash`
 5. VP の `AcpAgentHost` との比較（「VP の手書きの host との比較」の節）
 
@@ -287,9 +293,9 @@ agy 1.5.11、2026-11-18、この host 経由。
 |---|---|---|
 | 1 | initialize の protocolVersion | SDK 経由で通った（agy は 1 を返す） |
 | 2 | 型で読めるか | 応答（initialize / new / load / set_config_option / prompt）は SDK の型で読めた。通知は host が生の JSON で読むので、型では読んでいない。SDK の warn の log は確認していない（log を出して回していない） |
-| 3 | prompt の応答の後の update | 会話の中身（本文・tool）は来なかった。来たのは `available_commands_update` だけ（`SessionInit` の出し直しになる）。本文が空のまま turn が終わる件（VP design 88 §6.4）は起きなかった |
-| 4 | load の replay | 応答の前に届いた分は、`start_session()` が返った時点で stream に溜まっていた。その場で読み切って控えにできた。起動から確定まで約 2.0 秒（新規・load・立て直しとも） |
-| 5 | cancel | `session/cancel` から 14 ms で turn が終わった。終わりの後に本文は来なかった。permission の要求との順序は測れていない（下の「permission」） |
+| 3 | prompt の応答の後の update | turn の終わりの後 2 秒待っても、何も来なかった。最初の turn の途中に `available_commands_update` が来る（`SessionInit` の出し直しになる）。本文が空のまま turn が終わる件（VP design 88 §6.4）は起きなかった |
+| 4 | load の replay | 応答の前に届いた分は、`start_session()` が返った時点で stream に溜まっていた。その場で読み切って控えにできた。起動から確定まで 1.5〜2.1 秒（新規・load・立て直しとも） |
+| 5 | cancel | `session/cancel` から 2〜14 ms で turn が終わった。終わりの後に本文は来なかった。permission の要求との順序は測れていない（下の「permission」） |
 | 6 | stdout の中身 | JSON でない行で接続が切れることは無かった（4 本の E2E、約 10 turn） |
 | 7 | 遅い handler | 測っていない。permission の判断の関数で重い処理をしない、という使い方の決まりのまま |
 | 8a | 画像つきの発話 | 送れて、答えも返った。load の流れでは text だけが戻る（画像は `UserMessage` に出ない） |
@@ -303,6 +309,37 @@ permission:
 設定:
 - 切替（thought_level）は成功し、応答の設定面で値が変わった。不正な値は engine の文（`Unknown model ID`）で失敗し、`config_view().error` に残った
 - 「load の後に既定へ戻る」（VP design 88 §6.1）は、今回は確かめられなかった（既定の model が指定と同じ `gemini-3.8-flash` だった）
+
+### VP の手書きの host との比較
+
+同じシナリオを、VP の `AcpAgentHost`（nightly `504859ba`）とこの host で回し、broadcast に出た event の並びを比べた。agy 1.5.11、model は `gemini-3.8-flash`、2026-11-18。VP の側は、nightly の写しを repo の外に取り出して比較用のテストを 1 本足して回した（VP の repo は変えていない）。
+
+記号: Init = `SessionInit`、A = 本文、t = thinking、c = `ToolCall`、u = `ToolCallUpdate`、End = `TurnCompleted`。本文の chunk の数は回ごとに変わる。
+
+| 場面 | VP の `AcpAgentHost` | この host |
+|---|---|---|
+| 新規の 1 turn 目 | Init A Init End | Init A Init End |
+| 2 turn 目 | A End | A End |
+| 止めて再開（load）した直後 | Init Init | Init Init |
+| load の後の turn（前の 2 turn を覚えているか） | A End（覚えている） | t A End（覚えている） |
+| 長い turn を中断 | Init t t A → 中断 → Init End（3〜10 ms） | Init t A → 中断 → Init End（2〜14 ms） |
+| tool（file を作る） | Init t c u t A A A Init End | Init t c u A A A A Init End |
+| 過去の会話の履歴 | 出ない（replay_log だけ） | `history()` で U A U A が戻る |
+
+同じだった所:
+- turn の中の並び、tool の名前（`File hello.txt`）と結果の形、中断の速さ
+- 最初の turn の途中で `available_commands_update` が来て、`SessionInit` が turn の終わり（`TurnCompleted` の直前）に出し直される所
+
+違う所（意図したもの）:
+- **履歴**: この host は load の流れを `history()` で渡す。VP は捨てる
+- **load の失敗**: この host の既定は失敗として返す。VP は黙って新規にする（`LoadFallback::NewSession` を渡せば同じになる）
+- **permission の既定**: 許可の option が無い時、この host は取り消す。VP は先頭の option を選ぶ
+- **会話中の `user_message_chunk`**: どちらも出さない（結果は同じ）。この host は、自分が prompt を出していない時に来た分だけ `UserMessage` で出す
+- **結果まで入った `tool_call`**: この host は `ToolCallUpdate` も続ける。VP は `ToolCall` だけ（会話中は agy が update を別に送るので、差は load の流れでしか出ない）
+
+測り方の注意:
+- 1 回ずつの比較で、同じ入力でも model の答え方（thinking の有無、chunk の数）は回ごとに変わる。上の表の t と A の数の差は、host の差ではない
+- 画像と設定の切替は、VP の側では回していない（VP の既存の実機テスト `e2e_real_agy_image_prompt` / `e2e_real_agy_config_set_and_reapply` がある）
 
 ### 実測の記録
 
