@@ -26,6 +26,11 @@ Codex app-server の item 系通知（本文 delta / completed、reasoning、too
 `crates/host/src/codex_rpc_translate.rs`。本文は item 単位の `CodexMessage`、MCP の tool 名は
 `mcp__<server>__<tool>`（アプリが変更系 tool を名前で判定する）。thread / turn の lifecycle は各アプリの host。
 
+ACP（Agent Client Protocol）の client host は `crates/acp`（`agent-chat-acp`）。公式 SDK で
+ACP engine（agy 等）を動かし、process の起動・`session/load` の履歴・設定の当て直しを持つ。
+どの CLI をどう起動するか、会話 ID の永続化、permission の方針は、アプリが `LaunchContext` と
+`HostOptions` で渡す。まだどちらの consumer も依存していない（設計と実測は `docs/design/01-acp-client-host.md`）。
+
 ## 型変更と検証
 
 この repo の root で実行する。
@@ -34,6 +39,12 @@ Codex app-server の item 系通知（本文 delta / completed、reasoning、too
 cargo test --all-features
 cargo run -p agent-chat-protocol --features typescript --example export-types
 cargo fmt --all --check
+```
+
+ACP host の実機 E2E は CI では回らない（agy の CLI と認証が要り、model の使用枠を使う）。手元で:
+
+```sh
+cargo test -p agent-chat-acp --test agy_e2e -- --ignored --nocapture --test-threads=1
 ```
 
 `tests/fixtures.rs` が全 event kind の送信形を生成する。serde の
