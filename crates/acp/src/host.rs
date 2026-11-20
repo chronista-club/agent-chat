@@ -479,7 +479,8 @@ impl AcpClientHost {
         })
     }
 
-    /// 今の turn を中断する（`session/cancel`）。turn の最中でなければ何もしない。
+    /// 今の turn を中断し（`session/cancel`）、待たせていた発話を捨てる。
+    /// turn の最中でなくても、待ちは捨てる。
     pub fn interrupt(&self) -> Result<(), HostError> {
         self.send(Command::Interrupt)
     }
@@ -949,6 +950,10 @@ impl Connection {
                         }
                     }
                     Some(Command::Interrupt) => {
+                        // 待たせていた発話も捨てる。止めたのに次の発話が走り出さないように
+                        // （VP の codex / vpcode / 手書きの ACP の host と同じ）。捨てた発話は
+                        // まだ送っていないので、控えにも入っていない。
+                        self.queue.clear();
                         if self.in_turn
                             && let Err(e) = cx.send_notification(CancelNotification::new(
                                 self.session_id.clone(),

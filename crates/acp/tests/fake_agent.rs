@@ -26,6 +26,8 @@ struct Turn {
     updates: Vec<Value>,
     /// `session/cancel` が来るまで応答しない。
     wait_cancel: bool,
+    /// updates を送った後、応答までこの時間だけ待つ（turn の最中を作る）。
+    delay: Duration,
     /// 応答の前に permission を求める（options）。
     permission: Option<Value>,
     /// prompt の応答を error にする。
@@ -160,6 +162,9 @@ async fn fake_agent(mut peer: Channel, mut script: Script, log: Log) {
                         if turn.wait_cancel {
                             pending_prompt = Some(request.id.clone());
                             continue;
+                        }
+                        if !turn.delay.is_zero() {
+                            tokio::time::sleep(turn.delay).await;
                         }
                         if turn.error {
                             Err(agent_client_protocol::Error::internal_error())
@@ -823,7 +828,7 @@ async fn queued_prompts_go_one_at_a_time_with_images() {
     let turns = [
         Turn {
             updates: vec![agent_text("1")],
-            wait_cancel: true,
+            delay: Duration::from_millis(200),
             ..Turn::default()
         },
         Turn {
@@ -850,7 +855,6 @@ async fn queued_prompts_go_one_at_a_time_with_images() {
         1,
         "1 つ目の turn の最中は送らない"
     );
-    f.host.interrupt().unwrap();
     f.until_turn_end().await;
     f.until_turn_end().await;
     let prompts = f.params_of("session/prompt");
@@ -1118,6 +1122,94 @@ async fn restart_is_busy_while_a_turn_is_queued() {
     assert_eq!(f.host.restart().await, Err(HostError::Busy));
     f.host.interrupt().unwrap();
     f.until_turn_end().await;
+}
+
+/// 中断したら、待たせていた発話も捨てる（止めたのに次の発話が走り出さない）。
+/// 捨てた発話は送られず、控えにも入らない。その後の発話は普通に送れる。
+#[tokio::test]
+async fn interrupt_drops_queued_prompts() {
+    let turns = [
+        Turn {
+            updates: vec![agent_text("1")],
+            wait_cancel: true,
+            ..Turn::default()
+        },
+        Turn {
+            updates: vec![agent_text("次")],
+            ..Turn::default()
+        },
+    ];
+    let mut f = start(
+        vec![Script {
+            turns: turns.into(),
+            ..Script::default()
+        }],
+        HostOptions::default(),
+    );
+    f.host.submit("first", &[]).unwrap();
+    f.host.submit("捨てられる 1", &[]).unwrap();
+    f.host.submit("捨てられる 2", &[]).unwrap();
+    f.until(|e| matches!(e, E::MessageChunk { .. })).await;
+    f.host.interrupt().unwrap();
+    f.until_turn_end().await;
+
+    // 待たせていた発話が走り出さないこと: 次に送った発話が 2 つ目の prompt になる
+    f.host.submit("after", &[]).unwrap();
+    let events = f.until_turn_end().await;
+    assert!(events.contains(&msg("次")), "{events:?}");
+    let prompts: Vec<_> = f
+        .params_of("session/prompt")
+        .iter()
+        .map(|p| {
+            p["prompt"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(prompts, ["first", "after"]);
+    assert_eq!(
+        f.host.history().await.unwrap().events,
+        [user("first"), msg("1"), user("after"), msg("次")],
+        "捨てた発話は控えに入らない"
+    );
+}
+
+/// opencode は load で、tool を `tool_call`（pending）と `tool_call_update` の 2 段で流す
+/// （agy / grok は結果まで入った 1 件）。控えでは 1 組の `ToolCall` + `ToolCallUpdate` になる。
+#[tokio::test]
+async fn load_stream_with_pending_tool_call_then_update_is_one_pair() {
+    let script = Script {
+        replay: vec![
+            user_text("file を作って"),
+            json!({"sessionUpdate": "tool_call", "toolCallId": "t1", "status": "pending", "kind": "edit",
+                   "name": "write", "title": "write hello.txt", "locations": [{"path": "/w/hello.txt"}],
+                   "rawInput": {"path": "hello.txt"}}),
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed",
+                   "locations": [{"path": "/w/hello.txt"}], "rawOutput": {"ok": true},
+                   "content": [{"type": "content", "content": {"type": "text", "text": "wrote"}}]}),
+            agent_text("作りました"),
+        ],
+        ..Script::default()
+    };
+    let f = start(vec![script], resume("s-1"));
+    assert_eq!(
+        f.host.history().await.unwrap().events,
+        [
+            user("file を作って"),
+            E::ToolCall {
+                id: "t1".into(),
+                name: "write hello.txt".into(),
+                input: json!({"path": "hello.txt"}),
+            },
+            E::ToolCallUpdate {
+                tool_use_id: "t1".into(),
+                content: "wrote".into(),
+                is_error: false,
+            },
+            msg("作りました"),
+        ]
+    );
 }
 
 /// 会話が確定する前に接続が切れたら、確定の失敗として返す（確定の後の終了とは分ける）。
