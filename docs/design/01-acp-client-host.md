@@ -201,6 +201,8 @@ VP の `AcpAgentHost` に近い形にして、Stage 2 の差し替えを小さ�
 - `restart()` が `Busy` を返すのは、turn の最中・送っていない発話がある時・設定の切替の応答を待っている時
 - `pid()`: engine の process の pid。`restart()` で process が替わったら新しい pid、engine が終了したら None。process を持たない `Connector` は None（VP は chat engine の pid を lane の実体の印に使う）
 - `HostOptions::on_stderr`: engine の stderr を 1 行ごとに受け取る関数（既定は何もしない）。空行は渡さず、UTF-8 でない byte は置き換える。改行の無い出力は 8 KiB で区切って渡す。終了の文に付ける末尾 4 KB の保持は別に続けている。`spawn_with` で自前の connector を渡す時は、`ProcessConnector::on_stderr` で渡す
+- 確定の前に接続が切れたら `Establish`、確定の後なら `Dead`。engine が initialize を読む前に終了した時、切れ方は OS と時機で変わる（EOF が先か、書き込みの `Broken pipe` が先か）が、どちらでも `Establish` で返す
+- 終了の文に付ける stderr の末尾は、stderr の読み切りを 1 秒まで待ってから取る（engine が終了した直後は、最後に書いた分をまだ読んでいないことがある）。`restart()` と `stop()` では待たない
 - アプリが渡した関数（`on_session` / `permission`）が panic して host の task が落ちても、待っている呼び手は `Dead` を受け取り、`EngineExited` が出る
 
 ```rust
@@ -306,9 +308,9 @@ prompt の応答は `TurnCompleted` にする（context の使用量を載せる
 
 1. crate `crates/acp`（`agent-chat-acp`）。agent-chat の gate（fmt / clippy `-D warnings` / `test --all-features` / 生成物の drift）に乗っている
 2. calculations: 翻訳・設定・付随情報・permission・履歴の控え。fixture は VP design 88 §1・§6 の実測 wire（agy 1.5.9）と、今回の実測の形（agy 1.5.11）
-3. 偽の agent のテスト（`tests/fake_agent.rs`、31 本）
+3. 偽の agent のテスト（`tests/fake_agent.rs`、33 本）
    - 相手は SDK の `Channel::duplex()` の片側で、生の JSON-RPC を台本どおりに返す。SDK の `Agent.v1()` は使わなかった（load の応答の前後に通知を置く順序を、生の方が直接書ける）
-   - 場面: 新規の turn / load の流れが履歴になる / turn の最中の `history()` と中断 / 発話の写し / `restart()` / load の失敗（既定と新規）/ 待ちの上限 / 設定の当て直しと切替 / 知らない update / EOF / prompt の error / permission の方針 / 発話の順送りと画像 / `SessionInit` の保留 / 会話 ID の callback / 控えの上限 / 会話中に切り替えた設定が立て直しの後も残る / 立て直しの失敗 / 渡した関数の panic / `stop()` / 他の書き手の発話 / `attach()` / process の起動の失敗と stderr の末尾 / 設定の当て直しに答えない engine / pid / stderr の行渡し / 同じ messageId の発話
+   - 場面: 新規の turn / load の流れが履歴になる / turn の最中の `history()` と中断 / 発話の写し / `restart()` / load の失敗（既定と新規）/ 待ちの上限 / 設定の当て直しと切替 / 知らない update / EOF / prompt の error / permission の方針 / 発話の順送りと画像 / `SessionInit` の保留 / 会話 ID の callback / 控えの上限 / 会話中に切り替えた設定が立て直しの後も残る / 立て直しの失敗 / 渡した関数の panic / `stop()` / 他の書き手の発話 / `attach()` / process の起動の失敗と stderr の末尾 / 設定の当て直しに答えない engine / pid / stderr の行渡し / 同じ messageId の発話 / 確定の前に接続が切れる場面
 4. 実機 E2E（`tests/agy_e2e.rs`、`#[ignore]`、4 本 + 実物の会話を load して数える 1 本）: agy 1.5.11、model は `gemini-3.8-flash`
 5. VP の `AcpAgentHost` との比較（「VP の手書きの host との比較」の節）
 
