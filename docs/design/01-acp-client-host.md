@@ -205,7 +205,8 @@ VP の `AcpAgentHost` に近い形にして、Stage 2 の差し替えを小さ�
 - `restart()` が `Busy` を返すのは、turn の最中・送っていない発話がある時・設定の切替の応答を待っている時
 - `stop()` と drop は、会話の確定や設定の当て直しを待っている最中でも、すぐに process を止める。止める合図は命令の queue とは別に持つので、先に `submit` してまだ送っていない発話より先に効く（止めたはずの engine に発話を送ってから止める、が起きない）。止めた時は `EngineExited` を出さない
 - engine の終了や確定の失敗を見た時点で、`submit()` は Err を返し、`is_finished()` は true になる（stderr の読み切りを待つ前に）。呼び手は Err を見て host を作り直せる。`EngineExited` と終了の文（stderr の末尾つき）は、読み切りの後に出る
-- 送られなかった発話は黙って捨てない。確定の失敗や engine の終了で、待っていた発話があれば、`EngineExited` の前に `Error`（理由と件数）を出す。`stop()` と `interrupt()` で捨てた分は出さない（呼び手が自分で止めたため）
+- 会話を確定できなかった時は、`EngineExited` の前に、理由を `Error` で出す。待っていた発話が無くても出す（`EngineExited` の文を画面に出さない UI でも、chat を開いただけの人に理由が見える。VP の手書きの host も initialize / session/new の失敗を `Error` で出していた）
+- 送られなかった発話は黙って捨てない。確定の失敗や engine の終了で、受け取ってまだ送っていない発話があれば、`Error` に件数を添える。engine の終了は、待ちがある時だけ `Error` を出す。確定の後に接続そのものが失敗で終わった時（書き込みの失敗など）も数える。`stop()` と `interrupt()` で捨てた分は出さない（呼び手が自分で止めたため）
 - `is_finished()`: host が終了したかを、待たずに読む。true ならその host はもう使えない。立て直しの途中は false
 - `pid()`: engine の process の pid。`restart()` で process が替わったら新しい pid、engine が終了したら None。process を持たない `Connector` は None（VP は chat engine の pid を lane の実体の印に使う）
 - `HostOptions::on_stderr`: engine の stderr を 1 行ごとに受け取る関数（既定は何もしない）。空行は渡さず、UTF-8 でない byte は置き換える。改行の無い出力は 8 KiB で区切って渡す。終了の文に付ける末尾 4 KB の保持は別に続けている。8 KiB で区切る時は文字の途中で切れて、置き換え文字が 1 つ入ることがある（log 用なので許容）。接続のたびに末尾の buffer を新しくし、前の process の読み手を止めるので、立て直しの後に前の process（やその孫）が遅れて書いた分は、新しい process の末尾にも `on_stderr` にも混ざらない。`spawn_with` で自前の connector を渡す時は、`ProcessConnector::on_stderr` で渡す
@@ -316,7 +317,7 @@ prompt の応答は `TurnCompleted` にする（context の使用量を載せる
 
 1. crate `crates/acp`（`agent-chat-acp`）。agent-chat の gate（fmt / clippy `-D warnings` / `test --all-features` / 生成物の drift）に乗っている
 2. calculations: 翻訳・設定・付随情報・permission・履歴の控え。fixture は VP design 88 §1・§6 の実測 wire（agy 1.5.9）と、今回の実測の形（agy 1.5.11）
-3. 偽の agent のテスト（`tests/fake_agent.rs`、45 本）
+3. 偽の agent のテスト（`tests/fake_agent.rs`、47 本）
    - 相手は SDK の `Channel::duplex()` の片側で、生の JSON-RPC を台本どおりに返す。SDK の `Agent.v1()` は使わなかった（load の応答の前後に通知を置く順序を、生の方が直接書ける）
    - 場面: 新規の turn / load の流れが履歴になる / turn の最中の `history()` と中断 / 発話の写し / `restart()` / load の失敗（既定と新規）/ 待ちの上限 / 設定の当て直しと切替 / 知らない update / EOF / prompt の error / permission の方針 / 発話の順送りと画像 / `SessionInit` の保留 / 会話 ID の callback / 控えの上限 / 会話中に切り替えた設定が立て直しの後も残る / 立て直しの失敗 / 渡した関数の panic / `stop()` / 他の書き手の発話 / `attach()` / process の起動の失敗と stderr の末尾 / 設定の当て直しに答えない engine / pid / stderr の行渡し / 同じ messageId の発話 / 確定の前に接続が切れる場面 / 中断で待ちの発話を捨てる / pending の tool_call と update の 2 段の load / 確定の前と当て直しの最中の stop と drop / 終了の後の submit / 送られなかった発話の通知 / 未知の kind の permission
 4. 実機 E2E（`tests/agy_e2e.rs`、`#[ignore]`、4 本 + 実物の会話を load して数える 1 本）: agy 1.5.11、model は `gemini-3.8-flash`

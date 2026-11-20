@@ -340,6 +340,9 @@ struct Shared {
     session_init: Option<ConversationEvent>,
     /// 今の接続の process の pid。
     pid: Option<u32>,
+    /// 受け取ってまだ送っていない発話の数。接続がどの経路で終わっても、送られなかった数を
+    /// 知らせられるように、命令の loop の外から読める所に持つ。
+    queued: usize,
 }
 
 struct Ctx {
@@ -420,8 +423,8 @@ enum Exit {
     Restart(Reply<HistorySnapshot>),
     /// 会話が確定しなかった。
     Establish(String),
-    /// 確定の後に engine が終了した / 接続が切れた。`usize` は送れなかった待ちの発話の数。
-    Dead(String, usize),
+    /// 確定の後に engine が終了した / 接続が切れた。
+    Dead(String),
 }
 
 /// ACP engine の host。
@@ -468,6 +471,7 @@ impl AcpClientHost {
                 in_turn: false,
                 session_init: None,
                 pid: connector.pid(),
+                queued: 0,
             }),
             options,
         });
@@ -683,10 +687,13 @@ async fn supervise<C: Connector>(
                 Some(format!("会話を確定できませんでした（{message}）")),
                 0,
             ),
-            Exit::Dead(message, lost) => (
+            // 受け取ってまだ送っていない発話の数は Shared から読む。接続そのものが失敗で
+            // 終わった時（書き込みの失敗など）は命令の loop が途中で捨てられるので、
+            // loop の返り値では運べない。
+            Exit::Dead(message) => (
                 HostError::Dead(message),
                 Some("engine が終了しました".to_string()),
-                lost,
+                std::mem::take(&mut ctx.shared().queued),
             ),
         };
         // ここから先、この host はもう発話を受けない。すぐに `submit` が Err を返し、
@@ -716,11 +723,14 @@ async fn supervise<C: Connector>(
             HostError::Dead(message) => HostError::Dead(with_stderr(message, &stderr)),
             other => other,
         };
+        // 送られなかった発話は、黙って捨てずに会話に出す。確定の失敗は、待ちが無くても
+        // 理由を出す（`EngineExited` の文を画面に出さない UI でも、理由が見えるように）。
         if lost > 0 {
-            // 待っていた発話は送られていない。黙って捨てずに、会話に出す。
             ctx.emit(ConversationEvent::Error {
                 message: format!("{reason}。待っていた発話 {lost} 件は送られていません"),
             });
+        } else if matches!(error, HostError::Establish(_)) {
+            ctx.emit(ConversationEvent::Error { message: reason });
         }
         ctx.emit(ConversationEvent::EngineExited {
             message: error.to_string(),
@@ -803,7 +813,7 @@ async fn run_connection(
         .await;
     result.unwrap_or_else(|e| {
         if established.load(std::sync::atomic::Ordering::Relaxed) {
-            Exit::Dead(e.to_string(), 0)
+            Exit::Dead(e.to_string())
         } else {
             // 例: engine が initialize を読む前に終了し、書き込みが Broken pipe になった。
             Exit::Establish(e.to_string())
@@ -983,7 +993,7 @@ impl Connection {
                 () = ctx.stopped() => return Exit::Stop,
                 message = self.session.read_update() => match message {
                     Ok(message) => self.on_message(ctx, message, false),
-                    Err(e) => return Exit::Dead(e.to_string(), self.queue.len()),
+                    Err(e) => return Exit::Dead(e.to_string()),
                 },
                 Some(done) = config_rx.recv() => {
                     config_pending = config_pending.saturating_sub(1);
@@ -1011,8 +1021,11 @@ impl Connection {
                     None => return Exit::Stop,
                     Some(Command::Submit { text, images }) => {
                         self.queue.push_back((text, images));
+                        ctx.shared().queued = self.queue.len();
                         if let Err(message) = self.send_next(ctx) {
-                            return Exit::Dead(message, self.queue.len() + 1);
+                            // 送れなかった 1 件も、送られなかった数に入れる。
+                            ctx.shared().queued = self.queue.len() + 1;
+                            return Exit::Dead(message);
                         }
                     }
                     Some(Command::Interrupt) => {
@@ -1020,12 +1033,13 @@ impl Connection {
                         // （VP の codex / vpcode / 手書きの ACP の host と同じ）。捨てた発話は
                         // まだ送っていないので、控えにも入っていない。
                         self.queue.clear();
+                        ctx.shared().queued = 0;
                         if self.in_turn
                             && let Err(e) = cx.send_notification(CancelNotification::new(
                                 self.session_id.clone(),
                             ))
                         {
-                            return Exit::Dead(e.to_string(), self.queue.len());
+                            return Exit::Dead(e.to_string());
                         }
                     }
                     Some(Command::SetConfig { id, value, reply }) => {
@@ -1049,7 +1063,7 @@ impl Connection {
                             },
                         );
                         if let Err(e) = sent {
-                            return Exit::Dead(e.to_string(), self.queue.len());
+                            return Exit::Dead(e.to_string());
                         }
                         config_pending += 1;
                     }
@@ -1062,7 +1076,7 @@ impl Connection {
                     }
                 },
                 () = cx.incoming_closed() => {
-                    return Exit::Dead("engine の出力が閉じました".to_string(), self.queue.len());
+                    return Exit::Dead("engine の出力が閉じました".to_string());
                 }
             }
         }
@@ -1088,6 +1102,7 @@ impl Connection {
         self.in_turn = true;
         let mut shared = ctx.shared();
         shared.in_turn = true;
+        shared.queued = self.queue.len();
         // 控えには送信の時の text を入れる。engine が返す写しには頼らない。
         shared.history.push(ConversationEvent::UserMessage { text });
         Ok(())

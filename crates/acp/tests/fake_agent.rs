@@ -1282,6 +1282,150 @@ async fn submit_fails_as_soon_as_the_engine_is_gone() {
     );
 }
 
+/// 会話を確定できなかった時は、待っていた発話が無くても、理由を `Error` で会話に出す
+/// （`EngineExited` の文は GUI に出ないことがある。chat を開いただけの人にも理由が見える）。
+#[tokio::test]
+async fn failed_establish_always_reports_an_error() {
+    let mut f = start(
+        vec![Script {
+            load_error: true,
+            ..Script::default()
+        }],
+        resume("gone"),
+    );
+    let events = f.until(|e| matches!(e, E::EngineExited { .. })).await;
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert!(
+        matches!(&events[0], E::Error { message }
+            if message.contains("会話を確定できませんでした") && message.contains("session/load") && !message.contains("件")),
+        "{events:?}"
+    );
+}
+
+/// 途中から書き込みが失敗するようになる接続（確定の後に、接続そのものが失敗で終わる場面を作る）。
+struct FlakyWriter {
+    inner: tokio_util::compat::Compat<tokio::io::DuplexStream>,
+    broken: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl futures::AsyncWrite for FlakyWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.broken.load(Ordering::SeqCst) {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.broken.load(Ordering::SeqCst) {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_close(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_close(cx)
+    }
+}
+
+struct FlakyConnector {
+    broken: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Connector for FlakyConnector {
+    type Transport = agent_client_protocol::ByteStreams<
+        FlakyWriter,
+        tokio_util::compat::Compat<tokio::io::DuplexStream>,
+    >;
+    fn connect(&mut self) -> Result<Self::Transport, String> {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
+        let (client_out, agent_in) = tokio::io::duplex(64 * 1024);
+        let (agent_out, client_in) = tokio::io::duplex(64 * 1024);
+        // JSON の行で話す最小の agent。prompt には答えない（turn の最中のままにする）。
+        tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(agent_in).lines();
+            let mut out = agent_out;
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let result = match message["method"].as_str() {
+                    Some("initialize") => json!({"protocolVersion": 1, "agentCapabilities": {}}),
+                    Some("session/new") => json!({"sessionId": "new-1"}),
+                    _ => continue,
+                };
+                let reply = json!({"jsonrpc": "2.0", "id": message["id"], "result": result});
+                if out
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(agent_client_protocol::ByteStreams::new(
+            FlakyWriter {
+                inner: client_out.compat_write(),
+                broken: Arc::clone(&self.broken),
+            },
+            client_in.compat(),
+        ))
+    }
+}
+
+/// 確定の後に接続そのものが失敗で終わっても（書き込みの失敗）、待たせていた発話を数えて知らせる。
+#[tokio::test]
+async fn prompts_lost_to_a_broken_connection_are_reported() {
+    let broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let host = AcpClientHost::spawn_with(
+        FlakyConnector {
+            broken: Arc::clone(&broken),
+        },
+        PathBuf::from("/work"),
+        HostOptions::default(),
+    )
+    .expect("起動");
+    let mut events = host.subscribe();
+    host.history().await.expect("確定");
+    host.submit("turn の最中", &[]).unwrap();
+    host.submit("待ち 1", &[]).unwrap();
+    host.submit("待ち 2", &[]).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(host.history().await.unwrap().in_flight);
+
+    // ここから書き込みが失敗する。次に何かを書いた時に接続が失敗で終わる
+    broken.store(true, Ordering::SeqCst);
+    let _ = tokio::time::timeout(Duration::from_millis(300), host.set_config("model", "x")).await;
+
+    let mut seen = Vec::new();
+    loop {
+        let event = tokio::time::timeout(WAIT, events.recv())
+            .await
+            .unwrap_or_else(|_| panic!("終了を待ち切れない: {seen:?}"))
+            .unwrap();
+        let done = matches!(event, E::EngineExited { .. });
+        seen.push(event);
+        if done {
+            break;
+        }
+    }
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, E::Error { message } if message.contains("2 件"))),
+        "{seen:?}"
+    );
+}
+
 /// 会話を確定できなかった時、待っていた発話があれば、送られなかったことを `Error` で出す。
 #[tokio::test]
 async fn prompts_lost_to_a_failed_establish_are_reported() {
@@ -1630,11 +1774,17 @@ mod process {
             "{message}"
         );
         assert!(message.contains("added=yes removed=none"), "{message}");
-        let event = tokio::time::timeout(WAIT, events.recv())
+        // 確定の失敗は、理由を Error で出してから EngineExited
+        let first = tokio::time::timeout(WAIT, events.recv())
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(event, E::EngineExited { .. }), "{event:?}");
+        assert!(matches!(first, E::Error { .. }), "{first:?}");
+        let second = tokio::time::timeout(WAIT, events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(second, E::EngineExited { .. }), "{second:?}");
     }
 
     /// pid は起動した child のもの。engine が終了したら None。
