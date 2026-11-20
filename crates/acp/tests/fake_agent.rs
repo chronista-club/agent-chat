@@ -1493,6 +1493,192 @@ async fn permission_with_unknown_kind_is_refused_not_ignored() {
     assert!(answer.get("error").is_some(), "{answer}");
 }
 
+/// 会話の確定の前に送った発話は、まだ engine に送っていなくても、控えの末尾に入っている。
+/// 呼び手は控えを `ReplayStart` 〜 `ReplayEnd` で配って画面を作り直すので、控えに無い発話は画面から消える。
+/// 設定の当て直しを待っている間（確定の後、発話を送る前）に控えを取る場面で確かめる。
+#[tokio::test]
+async fn prompts_submitted_before_they_are_sent_appear_in_history() {
+    let script = Script {
+        replay: vec![user_text("前の質問"), agent_text("前の答え")],
+        config: config(),
+        config_hang: true,
+        turns: [Turn {
+            updates: vec![agent_text("新しい答え")],
+            ..Turn::default()
+        }]
+        .into(),
+        ..Script::default()
+    };
+    let mut f = start(
+        vec![script],
+        HostOptions {
+            config_intent: vec![("model".into(), "b".into())],
+            config_timeout: Duration::from_millis(300),
+            ..resume("s-1")
+        },
+    );
+    f.host.submit("確定の前に送った", &[]).unwrap();
+    let (history, _later) = f.host.attach().await.unwrap();
+    assert_eq!(
+        history.events,
+        [user("前の質問"), msg("前の答え"), user("確定の前に送った")],
+        "まだ送っていない発話も、待ちの順で末尾に入る"
+    );
+    assert!(history.in_flight, "これから turn が走る");
+    assert_eq!(
+        f.params_of("session/prompt").len(),
+        0,
+        "この時点ではまだ送っていない"
+    );
+
+    // 送った後は「待ち」から「控え」へ移る。二重にならない
+    f.until_turn_end().await;
+    let history = f.host.history().await.unwrap();
+    assert_eq!(
+        history.events,
+        [
+            user("前の質問"),
+            msg("前の答え"),
+            user("確定の前に送った"),
+            msg("新しい答え")
+        ]
+    );
+    assert!(!history.in_flight);
+}
+
+/// turn の最中に積まれた発話も同じ。今の turn の途中の本文の後ろに並ぶ。
+/// 中断で捨てた分は、控えから消える。
+#[tokio::test]
+async fn prompts_queued_during_a_turn_appear_in_history_until_dropped() {
+    let turn = Turn {
+        updates: vec![agent_text("途中")],
+        wait_cancel: true,
+        ..Turn::default()
+    };
+    let mut f = start(
+        vec![Script {
+            turns: [turn].into(),
+            ..Script::default()
+        }],
+        HostOptions::default(),
+    );
+    f.host.submit("first", &[]).unwrap();
+    f.until(|e| matches!(e, E::MessageChunk { .. })).await;
+    f.host.submit("待ち 1", &[]).unwrap();
+    f.host.submit("待ち 2", &[]).unwrap();
+    let history = f.host.history().await.unwrap();
+    assert_eq!(
+        history.events,
+        [user("first"), msg("途中"), user("待ち 1"), user("待ち 2")]
+    );
+    assert!(history.in_flight);
+
+    f.host.interrupt().unwrap();
+    f.until_turn_end().await;
+    let history = f.host.history().await.unwrap();
+    assert_eq!(history.events, [user("first"), msg("途中")]);
+    assert!(!history.in_flight);
+}
+
+/// 設定の当て直しが無くても同じ。確定の前に送った発話は、控えに 1 回だけ出る
+/// （待ちとして末尾に入った後、送られて控えに移っても、2 回にならない）。
+#[tokio::test]
+async fn a_prompt_never_appears_twice_across_attach_calls() {
+    let script = Script {
+        replay: vec![user_text("前の質問"), agent_text("前の答え")],
+        turns: [
+            Turn {
+                updates: vec![agent_text("答え 1")],
+                delay: Duration::from_millis(100),
+                ..Turn::default()
+            },
+            // 2 つ目の turn は、中断するまで終わらない（確認の間に全部終わってしまわないように）
+            Turn {
+                updates: vec![agent_text("答え 2")],
+                wait_cancel: true,
+                ..Turn::default()
+            },
+        ]
+        .into(),
+        ..Script::default()
+    };
+    let mut f = start(vec![script], resume("s-1"));
+    f.host.submit("一", &[]).unwrap();
+    f.host.submit("二", &[]).unwrap();
+    let count = |events: &[E], text: &str| events.iter().filter(|e| **e == user(text)).count();
+    // 確定の直後・1 つ目の turn の最中・全部終わった後のどこで取っても、各発話は 1 回ずつ
+    for _ in 0..3 {
+        let history = f.host.history().await.unwrap();
+        assert_eq!(
+            (count(&history.events, "一"), count(&history.events, "二")),
+            (1, 1),
+            "{:?}",
+            history.events
+        );
+        assert!(history.in_flight);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    // 1 つ目の turn の終わりを待ち、2 つ目の turn の本文が出てから、2 つ目を終わらせる
+    f.until_turn_end().await;
+    f.until(|e| matches!(e, E::MessageChunk { .. })).await;
+    let history = f.host.history().await.unwrap();
+    assert_eq!(
+        (count(&history.events, "一"), count(&history.events, "二")),
+        (1, 1),
+        "{:?}",
+        history.events
+    );
+    f.host.interrupt().unwrap();
+    f.until_turn_end().await;
+    let history = f.host.history().await.unwrap();
+    assert_eq!(
+        history.events,
+        [
+            user("前の質問"),
+            msg("前の答え"),
+            user("一"),
+            msg("答え 1"),
+            user("二"),
+            msg("答え 2")
+        ]
+    );
+    assert!(!history.in_flight);
+}
+
+/// 中断より後に送った発話は、待ちに残る（中断で消すのは、それより前の待ちだけ）。
+#[tokio::test]
+async fn prompts_submitted_after_an_interrupt_stay_pending() {
+    let turns = [
+        Turn {
+            updates: vec![agent_text("途中")],
+            wait_cancel: true,
+            ..Turn::default()
+        },
+        Turn {
+            updates: vec![agent_text("次")],
+            ..Turn::default()
+        },
+    ];
+    let mut f = start(
+        vec![Script {
+            turns: turns.into(),
+            ..Script::default()
+        }],
+        HostOptions::default(),
+    );
+    f.host.submit("first", &[]).unwrap();
+    f.until(|e| matches!(e, E::MessageChunk { .. })).await;
+    f.host.submit("捨てられる", &[]).unwrap();
+    f.host.interrupt().unwrap();
+    f.host.submit("中断の後", &[]).unwrap();
+    f.until_turn_end().await;
+    f.until_turn_end().await;
+    assert_eq!(
+        f.host.history().await.unwrap().events,
+        [user("first"), msg("途中"), user("中断の後"), msg("次")]
+    );
+}
+
 /// 中断したら、待たせていた発話も捨てる（止めたのに次の発話が走り出さない）。
 /// 捨てた発話は送られず、控えにも入らない。その後の発話は普通に送れる。
 #[tokio::test]

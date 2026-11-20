@@ -1,6 +1,6 @@
 # 01. ACP Client host — 公式 SDK で ACP engine を共有側から動かす
 
-> **Status**: Stage 1 を実装済み（2026-11-18）。crate、偽の agent のテスト、実機 agy の E2E、VP の手書き host との比較まで。Stage 2（VP への組み込み）は未着手
+> **Status**: Stage 1 を実装済み（2026-11-18、main に merge 済み）。crate、偽の agent のテスト、実機 agy の E2E、VP の手書き host との比較まで。Stage 2（VP への組み込み）は VP の側で進行中（VP PR #1271、2026-11-20 時点で draft）。その中で見つかった共有 host の直しは、この crate に入れている
 > **Related**: spark `mem_1Ch7ppZtnWBXnFjgLa7v2G`（mako 2026-11-17）、task `mem_1Ch7tUUcx4iNoDifCNG9gd`、VP design 86（共有チャット基盤）、VP design 88（agy の ACP 統合）
 > **対象**: `crates/acp/`（crate `agent-chat-acp`）
 
@@ -121,7 +121,8 @@ VP に残すもの:
      - 生きた接続に `session/load` をもう一度送っても、別 process の分は流れてこない（自分が覚えている分だけを返す）
      - そのまま prompt を送ると、別 process の分を知らずに答え、**保存からも別 process の分が消える**
      - `session/list` の updatedAt も変わらない。host は自分では気づけない
-   - なので、進めたことは呼び手が知らせる。VP は「console が動いた」を知っている。VP は chat → console に切り替えても chat の engine を止めないので、この場面は普通に起きる
+   - なので、進めたことは呼び手が知らせる。VP は「console が動いた」を知っている
+   - VP で実際にこの場面が起きるか: 同じ session を chat → console に切り替えると、reconcile が chat の engine を畳む（VP nightly `504859ba` の `repo/lane/reconcile.rs`、`drop_chat_engine_by_key`）。畳むのは console の slot を立てた後。chat に戻ると engine が立ち直って load するので、console の分が出る作りになっている。この文書は 2026-11-18 から 11-20 まで「VP は切り替えても chat の engine を止めない」と書いていたが、誤りだった（呼び出し元の grep が 1 つ足りなかった）。engine の性質の実測（下の「2 人の書き手」）は正しいまま。実機では確かめていない
    - `restart()` の中身: child を止める → 同じ起動の文脈で起動 → initialize → 今の session id で `session/load` → 設定の当て直し → 控えを置き換える。subscribe はそのまま使える
    - turn の最中は Err を返す（呼び手が中断してから呼ぶ）
    - 生きた接続に `session/load` を送り直すだけの口は作らない（上の実測で、役に立たないと分かった）
@@ -142,6 +143,8 @@ VP に残すもの:
 - **`restart()` が `Establish` / `Dead` を返したら、host は終了している**（`LoadFallback::Fail` で load に失敗した時、起動できなかった時など）。`EngineExited` も出る。その host はもう使えないので、呼び手が作り直す（`spawn` し直す）。`history()` / `submit()` も同じ Err を返す
 - **chat を開く時は `attach()`**。`history()` と `subscribe()` を別々に呼ばない
 - **`is_finished()` が true の host は使わない**。chat を開く時に見て、終了していたら作り直す
+  - `is_finished()` が true になってから `Error` / `EngineExited` が出るまで、最大 1 秒ある（stderr の読み切り）。その間に host を捨てて作り直すと、古い host の受け口を読むのをやめた時点で、「待っていた発話 N 件は送られていません」などの文は届かない。文を画面に出したい呼び手は、`EngineExited` を読んでから捨てる
+- **log の target は `agent_chat_acp`**。host の警告（load に失敗して新規に替えた、未対応の要求を断った、など）は `tracing` でこの target に出る。consumer の log の filter にこの target が無いと、警告が log から消える（VP は filter に足した）
 - **`permission` と `on_session` に重い処理を置かない**（接続全体が止まる）。`on_stderr` も同じく軽くする（こちらは stderr を読む task の中で呼ばれる）
 
 #### load の流れの読み切り
@@ -195,6 +198,11 @@ agy 1.5.9 は会話中も、送った発話を `user_message_chunk` で返して
 VP の `AcpAgentHost` に近い形にして、Stage 2 の差し替えを小さくする。実装は `crates/acp/src/host.rs`。下は要点で、正は code。
 
 - `submit` / `interrupt` / `stop` は待たない（命令を queue に入れるだけ）。turn の最中の `submit` は、終わってから順に送る
+- **受け取ってまだ送っていない発話も、`history()` / `attach()` の末尾に入る**（待ちの順の `UserMessage`）。待ちがあれば `in_flight` は true（これから turn が走る）。送った時に待ちから控えへ移るので、同じ発話が 2 回出ることは無い。`interrupt()` で捨てた分は消える
+  - 理由: 呼び手は控えで画面を作り直す（`ReplayStart` で表示を消す）。会話の確定（1.5〜2 秒）や設定の当て直しを待っている間に利用者が送った発話は、まだ engine に送っていないが、利用者から見れば送った発話。控えに無いと画面から消え、次の答えが前の答えの吹き出しにつながって見える（VP の acp-stage2 lane の自己レビューが見つけた、2026-11-20）
+  - 待ちの発話は控えの上限（`HistoryLimits`）の勘定の外。画像は入らない（`UserMessage` は text だけ）
+  - `restart()` の命令より後に `submit` された発話は、命令の列に残り、立て直した接続で送られる。その間も待ちに入っているので、`restart()` が返す控えの末尾に出る（意図した動き。テストは無い）
+- **会話の確定の前の `interrupt()` は、「送ってから止める」になる**（VP の手書きの host との違い）。`interrupt()` は命令の列に並ぶので、確定の前に「`submit(A)` → `interrupt()`」と呼ぶと、確定の後に「A を受け取る → turn の最中でないのですぐ A を送る → 中断（A の turn を `session/cancel`）」の順で処理される。A は engine に届き、控えにも入る。VP の手書きの host は、確定の前でも待ちをその場で捨てていたので、A は送られなかった。起きるのは「chat を開いて 2 秒ほどの間に送って、すぐ止めた」時だけなので、今は直していない（code を読んで確かめた。この順を見るテストは無い）。`stop()` は別で、確定の前でも先に効く
 - `interrupt()` は、今の turn を中断し（`session/cancel`）、待たせていた発話も捨てる。turn の最中でなくても待ちは捨てる。捨てた発話は送られず、控えにも入らない（控えには送信の時に入れるため）。捨てた件数は返さない
 - 失敗は `HostError`（`Spawn` / `Establish` / `Dead` / `Busy` / `Engine`）
 - `spawn_with(connector, cwd, options)`: 接続の作り方（`Connector`）を差し替える口。既定は process の起動。テストは偽の agent をつなぐ。`restart()` はこの口をもう一度呼ぶ
@@ -317,9 +325,9 @@ prompt の応答は `TurnCompleted` にする（context の使用量を載せる
 
 1. crate `crates/acp`（`agent-chat-acp`）。agent-chat の gate（fmt / clippy `-D warnings` / `test --all-features` / 生成物の drift）に乗っている
 2. calculations: 翻訳・設定・付随情報・permission・履歴の控え。fixture は VP design 88 §1・§6 の実測 wire（agy 1.5.9）と、今回の実測の形（agy 1.5.11）
-3. 偽の agent のテスト（`tests/fake_agent.rs`、47 本）
+3. 偽の agent のテスト（`tests/fake_agent.rs`、51 本）
    - 相手は SDK の `Channel::duplex()` の片側で、生の JSON-RPC を台本どおりに返す。SDK の `Agent.v1()` は使わなかった（load の応答の前後に通知を置く順序を、生の方が直接書ける）
-   - 場面: 新規の turn / load の流れが履歴になる / turn の最中の `history()` と中断 / 発話の写し / `restart()` / load の失敗（既定と新規）/ 待ちの上限 / 設定の当て直しと切替 / 知らない update / EOF / prompt の error / permission の方針 / 発話の順送りと画像 / `SessionInit` の保留 / 会話 ID の callback / 控えの上限 / 会話中に切り替えた設定が立て直しの後も残る / 立て直しの失敗 / 渡した関数の panic / `stop()` / 他の書き手の発話 / `attach()` / process の起動の失敗と stderr の末尾 / 設定の当て直しに答えない engine / pid / stderr の行渡し / 同じ messageId の発話 / 確定の前に接続が切れる場面 / 中断で待ちの発話を捨てる / pending の tool_call と update の 2 段の load / 確定の前と当て直しの最中の stop と drop / 終了の後の submit / 送られなかった発話の通知 / 未知の kind の permission
+   - 場面: 新規の turn / load の流れが履歴になる / turn の最中の `history()` と中断 / 発話の写し / `restart()` / load の失敗（既定と新規）/ 待ちの上限 / 設定の当て直しと切替 / 知らない update / EOF / prompt の error / permission の方針 / 発話の順送りと画像 / `SessionInit` の保留 / 会話 ID の callback / 控えの上限 / 会話中に切り替えた設定が立て直しの後も残る / 立て直しの失敗 / 渡した関数の panic / `stop()` / 他の書き手の発話 / `attach()` / process の起動の失敗と stderr の末尾 / 設定の当て直しに答えない engine / pid / stderr の行渡し / 同じ messageId の発話 / 確定の前に接続が切れる場面 / 中断で待ちの発話を捨てる / pending の tool_call と update の 2 段の load / 確定の前と当て直しの最中の stop と drop / 終了の後の submit / 送られなかった発話の通知 / 未知の kind の permission / まだ送っていない発話が控えに入る
 4. 実機 E2E（`tests/agy_e2e.rs`、`#[ignore]`、4 本 + 実物の会話を load して数える 1 本）: agy 1.5.11、model は `gemini-3.8-flash`
 5. VP の `AcpAgentHost` との比較（「VP の手書きの host との比較」の節）
 
@@ -352,6 +360,7 @@ permission:
 - なので、実機では permission の要求を 1 度も受けていない。要求への答え方は偽の agent のテストだけで確かめている
 
 設定:
+- `set_config()` が `config_timeout` で時間切れになった時は、呼び手に Err を返すが、`config_view().error` には書かない（engine が error を返した時は書く）。VP の手書きの host は時間切れも設定面に書いていた
 - 切替（thought_level）は成功し、応答の設定面で値が変わった。不正な値は engine の文（`Unknown model ID`）で失敗し、`config_view().error` に残った
 - 「load の後に既定へ戻る」（VP design 88 §6.1）は、今回は確かめられなかった（既定の model が指定と同じ `gemini-3.8-flash` だった）
 

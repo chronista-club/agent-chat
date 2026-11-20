@@ -340,9 +340,13 @@ struct Shared {
     session_init: Option<ConversationEvent>,
     /// 今の接続の process の pid。
     pid: Option<u32>,
-    /// 受け取ってまだ送っていない発話の数。接続がどの経路で終わっても、送られなかった数を
-    /// 知らせられるように、命令の loop の外から読める所に持つ。
-    queued: usize,
+    /// 受け取ってまだ engine に送っていない発話の本文（受け取った順）。`submit()` の時点で入れ、
+    /// 送った時に控え（history）へ移す。中断で捨てた分はここから消す。
+    ///
+    /// 命令の loop の外に持つ理由は 2 つ。会話の確定や設定の当て直しを待っている間は loop が
+    /// まだ命令を読んでいないが、その間に取った控えにも発話を入れたい。接続がどの経路で
+    /// 終わっても、送られなかった数を知らせたい。
+    pending: VecDeque<String>,
 }
 
 struct Ctx {
@@ -394,8 +398,26 @@ impl Ctx {
     }
 
     fn snapshot(&self) -> HistorySnapshot {
-        let shared = self.shared();
-        shared.history.snapshot(shared.in_turn)
+        self.shared().snapshot()
+    }
+}
+
+impl Shared {
+    /// 呼び手に渡す履歴。控えの後ろに、受け取ってまだ送っていない発話を待ちの順で並べる。
+    ///
+    /// 呼び手はこれで画面を作り直すので、ここに無い発話は画面から消える。まだ送っていない
+    /// 発話も、利用者から見れば「送った」発話。待ちがあれば、これから turn が走るので
+    /// `in_flight` は true。
+    fn snapshot(&self) -> HistorySnapshot {
+        let mut snapshot = self
+            .history
+            .snapshot(self.in_turn || !self.pending.is_empty());
+        snapshot.events.extend(
+            self.pending
+                .iter()
+                .map(|text| ConversationEvent::UserMessage { text: text.clone() }),
+        );
+        snapshot
     }
 }
 
@@ -471,7 +493,7 @@ impl AcpClientHost {
                 in_turn: false,
                 session_init: None,
                 pid: connector.pid(),
-                queued: 0,
+                pending: VecDeque::new(),
             }),
             options,
         });
@@ -489,11 +511,20 @@ impl AcpClientHost {
     }
 
     /// 発話を送る。turn の最中なら、終わってから順に送る。
+    ///
+    /// 受け取った発話は、まだ engine に送っていなくても、`history()` / `attach()` の末尾に入る。
     pub fn submit(&self, text: &str, images: &[PromptImage]) -> Result<(), HostError> {
-        self.send(Command::Submit {
+        // 待ちへの追加と命令の送信を同じ lock の中で行う（待ちの順と命令の順をずらさない）。
+        let mut shared = self.ctx.shared();
+        shared.pending.push_back(text.to_string());
+        let sent = self.send(Command::Submit {
             text: text.to_string(),
             images: images.to_vec(),
-        })
+        });
+        if sent.is_err() {
+            shared.pending.pop_back();
+        }
+        sent
     }
 
     /// 今の turn を中断し（`session/cancel`）、待たせていた発話を捨てる。
@@ -567,10 +598,7 @@ impl AcpClientHost {
             }
             // 控えへの追加と event の送信は同じ lock の中で行われるので、ここで揃う。
             let shared = self.ctx.shared();
-            let attached = (
-                shared.history.snapshot(shared.in_turn),
-                self.ctx.events.subscribe(),
-            );
+            let attached = (shared.snapshot(), self.ctx.events.subscribe());
             drop(shared);
             // 取っている間に立て直しが始まっていたら、新しい控えを待ち直す
             // （立て直しは、控えを空にする前に Starting にする）。
@@ -665,7 +693,7 @@ async fn supervise<C: Connector>(
         };
         connector.shutdown();
         ctx.shared().pid = None;
-        let (early, reason, mut lost) = match exit {
+        let (early, reason, lost) = match exit {
             Exit::Restart(reply) if !*ctx.stop.borrow() => {
                 // 先に Starting にする。控えを空にした後で Ready のまま読まれないように。
                 ctx.phase.send_replace(Phase::Starting);
@@ -685,15 +713,15 @@ async fn supervise<C: Connector>(
             Exit::Establish(message) => (
                 HostError::Establish(message.clone()),
                 Some(format!("会話を確定できませんでした（{message}）")),
-                0,
+                ctx.shared().pending.len(),
             ),
-            // 受け取ってまだ送っていない発話の数は Shared から読む。接続そのものが失敗で
+            // 送られなかった発話の数は、待ち（Shared.pending）から読む。接続そのものが失敗で
             // 終わった時（書き込みの失敗など）は命令の loop が途中で捨てられるので、
             // loop の返り値では運べない。
             Exit::Dead(message) => (
                 HostError::Dead(message),
                 Some("engine が終了しました".to_string()),
-                std::mem::take(&mut ctx.shared().queued),
+                ctx.shared().pending.len(),
             ),
         };
         // ここから先、この host はもう発話を受けない。すぐに `submit` が Err を返し、
@@ -703,7 +731,8 @@ async fn supervise<C: Connector>(
         commands.close();
         while let Ok(command) = commands.try_recv() {
             match command {
-                Command::Submit { .. } => lost += 1,
+                // 送られなかった発話は、待ち（Shared.pending）の数で数える。
+                Command::Submit { .. } => {}
                 Command::Restart { reply } => drop(reply.send(Err(early.clone()))),
                 Command::SetConfig { reply, .. } => drop(reply.send(Err(early.clone()))),
                 Command::Interrupt => {}
@@ -1021,10 +1050,7 @@ impl Connection {
                     None => return Exit::Stop,
                     Some(Command::Submit { text, images }) => {
                         self.queue.push_back((text, images));
-                        ctx.shared().queued = self.queue.len();
                         if let Err(message) = self.send_next(ctx) {
-                            // 送れなかった 1 件も、送られなかった数に入れる。
-                            ctx.shared().queued = self.queue.len() + 1;
                             return Exit::Dead(message);
                         }
                     }
@@ -1032,8 +1058,14 @@ impl Connection {
                         // 待たせていた発話も捨てる。止めたのに次の発話が走り出さないように
                         // （VP の codex / vpcode / 手書きの ACP の host と同じ）。捨てた発話は
                         // まだ送っていないので、控えにも入っていない。
+                        // 待ちの先頭から、loop が受け取っていた分だけ消す（この中断より後に
+                        // `submit` された分は、まだ命令の列にあるので残す）。
+                        let dropped = self.queue.len();
                         self.queue.clear();
-                        ctx.shared().queued = 0;
+                        let mut shared = ctx.shared();
+                        let dropped = dropped.min(shared.pending.len());
+                        shared.pending.drain(..dropped);
+                        drop(shared);
                         if self.in_turn
                             && let Err(e) = cx.send_notification(CancelNotification::new(
                                 self.session_id.clone(),
@@ -1102,8 +1134,9 @@ impl Connection {
         self.in_turn = true;
         let mut shared = ctx.shared();
         shared.in_turn = true;
-        shared.queued = self.queue.len();
-        // 控えには送信の時の text を入れる。engine が返す写しには頼らない。
+        // 送ったので、待ちから控えへ移す。控えには送信の時の text を入れる
+        // （engine が返す写しには頼らない）。送信に失敗した時は、待ちに残したまま抜けている。
+        shared.pending.pop_front();
         shared.history.push(ConversationEvent::UserMessage { text });
         Ok(())
     }
