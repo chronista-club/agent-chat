@@ -171,6 +171,7 @@ host は、`start_session()` が返った時点で stream に溜まっている�
   - opencode が 1 つの発話を複数の chunk で流す実例は、まだ取れていない（実測は 1 発話 1 chunk）。まとめる処理は偽の agent のテストでだけ確かめている
 - **本文と thinking**: 続く chunk は控えの中で 1 件にまとめる
 - **tool**: `tool_call` の status が completed / failed なら、`ToolCall` と `ToolCallUpdate` の 2 つにする。会話中も同じ規則
+  - agy と grok の load は、結果まで入った `tool_call` 1 件で流す。opencode 2.3.0 の load は、`tool_call`（status=pending）と `tool_call_update` の 2 段で流す（会話中と同じ形）。どちらも控えでは 1 組の `ToolCall` + `ToolCallUpdate` になる
 - **履歴に入れないもの**: usage / commands / 設定 / session_info は状態として持つだけ（今と同じ）
 
 #### 会話中の `user_message_chunk`
@@ -193,6 +194,7 @@ agy 1.5.9 は会話中も、送った発話を `user_message_chunk` で返して
 VP の `AcpAgentHost` に近い形にして、Stage 2 の差し替えを小さくする。実装は `crates/acp/src/host.rs`。下は要点で、正は code。
 
 - `submit` / `interrupt` / `stop` は待たない（命令を queue に入れるだけ）。turn の最中の `submit` は、終わってから順に送る
+- `interrupt()` は、今の turn を中断し（`session/cancel`）、待たせていた発話も捨てる。turn の最中でなくても待ちは捨てる。捨てた発話は送られず、控えにも入らない（控えには送信の時に入れるため）。捨てた件数は返さない
 - 失敗は `HostError`（`Spawn` / `Establish` / `Dead` / `Busy` / `Engine`）
 - `spawn_with(connector, cwd, options)`: 接続の作り方（`Connector`）を差し替える口。既定は process の起動。テストは偽の agent をつなぐ。`restart()` はこの口をもう一度呼ぶ
 - permission の既定の方針は `permission::allow`（kind で allow_once → allow_always、無ければ取り消し）
@@ -308,9 +310,9 @@ prompt の応答は `TurnCompleted` にする（context の使用量を載せる
 
 1. crate `crates/acp`（`agent-chat-acp`）。agent-chat の gate（fmt / clippy `-D warnings` / `test --all-features` / 生成物の drift）に乗っている
 2. calculations: 翻訳・設定・付随情報・permission・履歴の控え。fixture は VP design 88 §1・§6 の実測 wire（agy 1.5.9）と、今回の実測の形（agy 1.5.11）
-3. 偽の agent のテスト（`tests/fake_agent.rs`、34 本）
+3. 偽の agent のテスト（`tests/fake_agent.rs`、36 本）
    - 相手は SDK の `Channel::duplex()` の片側で、生の JSON-RPC を台本どおりに返す。SDK の `Agent.v1()` は使わなかった（load の応答の前後に通知を置く順序を、生の方が直接書ける）
-   - 場面: 新規の turn / load の流れが履歴になる / turn の最中の `history()` と中断 / 発話の写し / `restart()` / load の失敗（既定と新規）/ 待ちの上限 / 設定の当て直しと切替 / 知らない update / EOF / prompt の error / permission の方針 / 発話の順送りと画像 / `SessionInit` の保留 / 会話 ID の callback / 控えの上限 / 会話中に切り替えた設定が立て直しの後も残る / 立て直しの失敗 / 渡した関数の panic / `stop()` / 他の書き手の発話 / `attach()` / process の起動の失敗と stderr の末尾 / 設定の当て直しに答えない engine / pid / stderr の行渡し / 同じ messageId の発話 / 確定の前に接続が切れる場面
+   - 場面: 新規の turn / load の流れが履歴になる / turn の最中の `history()` と中断 / 発話の写し / `restart()` / load の失敗（既定と新規）/ 待ちの上限 / 設定の当て直しと切替 / 知らない update / EOF / prompt の error / permission の方針 / 発話の順送りと画像 / `SessionInit` の保留 / 会話 ID の callback / 控えの上限 / 会話中に切り替えた設定が立て直しの後も残る / 立て直しの失敗 / 渡した関数の panic / `stop()` / 他の書き手の発話 / `attach()` / process の起動の失敗と stderr の末尾 / 設定の当て直しに答えない engine / pid / stderr の行渡し / 同じ messageId の発話 / 確定の前に接続が切れる場面 / 中断で待ちの発話を捨てる / pending の tool_call と update の 2 段の load
 4. 実機 E2E（`tests/agy_e2e.rs`、`#[ignore]`、4 本 + 実物の会話を load して数える 1 本）: agy 1.5.11、model は `gemini-3.8-flash`
 5. VP の `AcpAgentHost` との比較（「VP の手書きの host との比較」の節）
 
@@ -362,6 +364,7 @@ permission:
 | 過去の会話の履歴 | 出ない（replay_log だけ） | `history()` で U A U A が戻る |
 
 同じだった所:
+- 中断で、待たせていた発話も捨てる（VP の codex / vpcode / 手書きの ACP の host は、どれも中断で待ち行列を空にする）。この host は最初、`session/cancel` を送るだけで待ちを残していた。比較のシナリオに「待ちがある状態での中断」が無く、VP の acp-stage2 lane が見つけた（2026-11-20）。lead の判断で VP に合わせた
 - turn の中の並び、tool の名前（`File hello.txt`）と結果の形、中断の速さ
 - 最初の turn の途中で `available_commands_update` が来て、`SessionInit` が turn の終わり（`TurnCompleted` の直前）に出し直される所
 
@@ -443,3 +446,15 @@ load の流れ（VP lead の実測）:
 - 既定の上限でも **12 turn が全部残った**。落ちたのは、1 件 32 KiB を超えた分の先頭だけ（tool の結果など）。それで 3.46 MB が 1.04 MB になった
 - ただし全体の上限（1,048,576 bytes）まで残り約 11 KB しか無い。この会話があと少し伸びると、古い turn から落ち始める
 - 起動から確定まで 1.7〜2.0 秒
+
+engine ごとの「2 人の書き手」（VP の acp-stage2 lane の実測、2026-11-20。opencode 2.3.0 と grok 1.0.89 は試験用の会話で 1 回ずつ。agy は上の記録）:
+
+| 確かめたこと | opencode 2.3.0 | grok 1.0.89 | agy 1.5.11 |
+|---|---|---|---|
+| 生きた process に `session/load` をもう一度 | 2 人目の turn も流れる | 流れる | 流れない |
+| 生きた process に「合言葉を全部挙げて」 | 全部答える | 2 人目の分を答えない | 自分の分だけ |
+| その後、新しい process で load | 全部残る | 残る | 2 人目の分が消える |
+
+- opencode は、生きた process が 2 人目の turn を知っていた。process が共有の background service につなぐ作りだから、というのは推測（`opencode --help` の文言から）
+- `restart()` は 3 つのどれでも安全側に働く（opencode では要らないだけ）。engine ごとに呼ぶかどうかは呼び手が決める
+- opencode は `user_message_chunk` / `agent_message_chunk` / `agent_thought_chunk` の全部に `messageId` を付ける（会話中も load でも）。1 つの発話が複数の chunk に分かれる例は取れていない（短い発話 4 つで 1 発話 1 chunk）。会話中は `user_message_chunk` が来ない
