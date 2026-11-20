@@ -105,11 +105,41 @@ fn is_terminal(status: &str) -> bool {
 pub struct AcpTranslator {
     /// `tool_call` で ToolCall を emit 済みの toolCallId（update 側の補完判定）。
     started_tools: HashSet<String>,
+    /// 直前の `user_message_chunk` の `messageId`。会話の中身の update が挟まったら消す。
+    last_user_message_id: Option<String>,
+}
+
+/// `user_message_chunk` 1 件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserChunk {
+    pub text: String,
+    /// 直前の chunk と同じ `messageId` = 同じ発話の続き。
+    ///
+    /// `messageId` を付ける engine（opencode 2.3.0）でだけ true になる。付けない engine
+    /// （agy 1.5.11）では、続きか別の発話かを見分けられないので、いつも false（別の発話）。
+    pub continues: bool,
 }
 
 impl AcpTranslator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// `user_message_chunk`（text）なら、その本文と「直前の chunk の続きか」を返す。
+    /// 履歴で 1 つの発話にまとめたい呼び手は、[`Self::ingest`] の前にこちらを呼ぶ。
+    pub fn ingest_user_chunk(&mut self, update: &serde_json::Value) -> Option<UserChunk> {
+        if update.get("sessionUpdate").and_then(|v| v.as_str()) != Some("user_message_chunk") {
+            return None;
+        }
+        let id = update
+            .get("messageId")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        let continues = id.is_some() && id == self.last_user_message_id;
+        self.last_user_message_id = id;
+        let text = update.get("content").and_then(content_text)?;
+        Some(UserChunk { text, continues })
     }
 
     /// `session/update` の params.update 1 件を食わせ、0 個以上の [`ConversationEvent`] を得る。
@@ -119,6 +149,18 @@ impl AcpTranslator {
             .get("sessionUpdate")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        // 会話の中身が挟まったら、次の user の chunk は続きにしない。
+        // usage / session_info などの状態の通知は挟まっても続きのまま。
+        if matches!(
+            kind,
+            "agent_message_chunk"
+                | "agent_thought_chunk"
+                | "tool_call"
+                | "tool_call_update"
+                | "plan"
+        ) {
+            self.last_user_message_id = None;
+        }
         match kind {
             "agent_message_chunk" => update
                 .get("content")
@@ -130,10 +172,9 @@ impl AcpTranslator {
                 .and_then(content_text)
                 .map(|text| vec![ConversationEvent::ThoughtChunk { text }])
                 .unwrap_or_default(),
-            "user_message_chunk" => update
-                .get("content")
-                .and_then(content_text)
-                .map(|text| vec![ConversationEvent::UserMessage { text }])
+            "user_message_chunk" => self
+                .ingest_user_chunk(update)
+                .map(|chunk| vec![ConversationEvent::UserMessage { text: chunk.text }])
                 .unwrap_or_default(),
             "tool_call" => {
                 let id = update
@@ -455,5 +496,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tr.ingest(&img), Vec::new());
+    }
+
+    /// opencode 2.3.0 は `user_message_chunk` に `messageId` を付ける（2026-11-20 実測）。
+    /// 同じ id が続いたら、同じ発話の続き。id が無い（agy）・違う・間に他の update が挟まるなら別の発話。
+    #[test]
+    fn user_chunks_with_same_message_id_continue_one_message() {
+        let chunk = |id: Option<&str>, text: &str| {
+            let mut u = serde_json::json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": text},
+            });
+            if let Some(id) = id {
+                u["messageId"] = id.into();
+            }
+            u
+        };
+        let mut tr = AcpTranslator::new();
+        let ingest = |tr: &mut AcpTranslator, u: &serde_json::Value| {
+            let c = tr.ingest_user_chunk(u).expect("user の発話");
+            (c.text, c.continues)
+        };
+        assert_eq!(
+            ingest(&mut tr, &chunk(Some("m1"), "he")),
+            ("he".into(), false)
+        );
+        assert_eq!(
+            ingest(&mut tr, &chunk(Some("m1"), "llo")),
+            ("llo".into(), true)
+        );
+        assert_eq!(
+            ingest(&mut tr, &chunk(Some("m2"), "x")),
+            ("x".into(), false)
+        );
+        assert_eq!(ingest(&mut tr, &chunk(None, "y")), ("y".into(), false));
+        assert_eq!(
+            ingest(&mut tr, &chunk(None, "z")),
+            ("z".into(), false),
+            "id が無ければ別の発話"
+        );
+
+        // 間に他の update が挟まったら、同じ id でも続きにしない
+        assert_eq!(
+            ingest(&mut tr, &chunk(Some("m3"), "a")),
+            ("a".into(), false)
+        );
+        let answer: serde_json::Value = serde_json::from_str(
+            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ok"}}"#,
+        )
+        .unwrap();
+        tr.ingest(&answer);
+        assert_eq!(
+            ingest(&mut tr, &chunk(Some("m3"), "b")),
+            ("b".into(), false)
+        );
+
+        // user の発話でない update は None。text でない発話も None
+        assert!(tr.ingest_user_chunk(&answer).is_none());
+        let image = serde_json::json!({"sessionUpdate": "user_message_chunk", "messageId": "m4",
+            "content": {"type": "image", "mimeType": "image/png", "data": "AAAA"}});
+        assert!(tr.ingest_user_chunk(&image).is_none());
     }
 }

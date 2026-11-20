@@ -39,6 +39,8 @@ struct Turn {
 struct Script {
     /// initialize に答えない。
     hang: bool,
+    /// 何も読まずに接続を閉じる（起動してすぐ終了した engine）。
+    gone: bool,
     /// load の応答の前に流す update。
     replay: Vec<Value>,
     /// load の応答の後に流す update。
@@ -70,6 +72,9 @@ async fn fake_agent(mut peer: Channel, mut script: Script, log: Log) {
         .expect("update");
         let _ = peer.tx.unbounded_send(TransportFrame::Single(message));
     };
+    if script.gone {
+        return;
+    }
     let mut session = "new-1".to_string();
     let mut pending_prompt = None;
     let mut pending_permission = None;
@@ -199,6 +204,8 @@ async fn fake_agent(mut peer: Channel, mut script: Script, log: Log) {
 struct FakeConnector {
     scripts: VecDeque<Script>,
     log: Log,
+    /// process を持つ connector のふりをする時の pid（接続のたびに 1 ずつ増やす）。
+    pid: Option<u32>,
 }
 
 impl Connector for FakeConnector {
@@ -207,7 +214,11 @@ impl Connector for FakeConnector {
         let script = self.scripts.pop_front().ok_or("台本がもう無い")?;
         let (client, agent) = Channel::duplex();
         tokio::spawn(fake_agent(agent, script, Arc::clone(&self.log)));
+        self.pid = self.pid.map(|pid| pid + 1);
         Ok(client)
+    }
+    fn pid(&self) -> Option<u32> {
+        self.pid
     }
 }
 
@@ -218,10 +229,15 @@ struct Fixture {
 }
 
 fn start(scripts: Vec<Script>, options: HostOptions) -> Fixture {
+    start_with_pid(scripts, options, None)
+}
+
+fn start_with_pid(scripts: Vec<Script>, options: HostOptions, pid: Option<u32>) -> Fixture {
     let log = Log::default();
     let connector = FakeConnector {
         scripts: scripts.into(),
         log: Arc::clone(&log),
+        pid,
     };
     let host = AcpClientHost::spawn_with(connector, PathBuf::from("/work"), options).expect("起動");
     let events = host.subscribe();
@@ -1104,6 +1120,145 @@ async fn restart_is_busy_while_a_turn_is_queued() {
     f.until_turn_end().await;
 }
 
+/// 会話が確定する前に接続が切れたら、確定の失敗として返す（確定の後の終了とは分ける）。
+/// 切れ方（EOF が先か、書き込みの失敗が先か）は OS と時機で変わる。
+#[tokio::test]
+async fn connection_lost_before_establish_is_an_establish_error() {
+    for _ in 0..20 {
+        let f = start(
+            vec![Script {
+                gone: true,
+                ..Script::default()
+            }],
+            HostOptions::default(),
+        );
+        let error = tokio::time::timeout(WAIT, f.host.history())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, HostError::Establish(_)), "{error:?}");
+    }
+}
+
+/// 書き込みが必ず `Broken pipe` になり、何も読めない接続（initialize を読む前に終了した engine を、
+/// 時機に頼らずに再現する。Linux の CI では実 process でこの切れ方になった）。
+struct BrokenPipe;
+
+impl futures::AsyncWrite for BrokenPipe {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        _: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+    }
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl futures::AsyncRead for BrokenPipe {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        _: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Pending
+    }
+}
+
+struct BrokenPipeConnector;
+
+impl Connector for BrokenPipeConnector {
+    type Transport = agent_client_protocol::ByteStreams<BrokenPipe, BrokenPipe>;
+    fn connect(&mut self) -> Result<Self::Transport, String> {
+        Ok(agent_client_protocol::ByteStreams::new(
+            BrokenPipe, BrokenPipe,
+        ))
+    }
+    fn stderr_tail(&self) -> String {
+        "engine の最後の言葉".to_string()
+    }
+}
+
+/// 確定の前に書き込みが失敗して接続が切れても、確定の失敗として返す。stderr の末尾も付く。
+#[tokio::test]
+async fn write_failure_before_establish_is_an_establish_error() {
+    let host = AcpClientHost::spawn_with(
+        BrokenPipeConnector,
+        PathBuf::from("/work"),
+        HostOptions::default(),
+    )
+    .expect("起動");
+    let error = tokio::time::timeout(WAIT, host.history())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(&error, HostError::Establish(m) if m.contains("engine の最後の言葉")),
+        "{error:?}"
+    );
+}
+
+/// process を持たない connector の pid は None。持つなら、立て直しで新しい pid に替わる。
+#[tokio::test]
+async fn pid_follows_the_current_connection() {
+    let f = start(vec![Script::default()], HostOptions::default());
+    f.host.history().await.unwrap();
+    assert_eq!(f.host.pid(), None);
+
+    let mut f = start_with_pid(
+        vec![Script::default(), Script::default()],
+        HostOptions::default(),
+        Some(100),
+    );
+    assert_eq!(f.host.pid(), Some(101), "起動した時点で読める");
+    f.until(|e| matches!(e, E::SessionInit { .. })).await;
+    f.host.restart().await.unwrap();
+    assert_eq!(f.host.pid(), Some(102));
+    f.host.stop();
+    tokio::time::timeout(WAIT, async {
+        while f.host.pid().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("止めたら pid は None");
+}
+
+/// 同じ `messageId` の `user_message_chunk` が続いたら 1 つの発話にする（opencode）。
+#[tokio::test]
+async fn user_chunks_sharing_a_message_id_form_one_history_message() {
+    let user_chunk = |id: &str, text: &str| {
+        json!({"sessionUpdate": "user_message_chunk", "messageId": id,
+               "content": {"type": "text", "text": text}})
+    };
+    let script = Script {
+        replay: vec![
+            user_chunk("m1", "he"),
+            user_chunk("m1", "llo"),
+            agent_text("答え"),
+            user_chunk("m2", "x"),
+            user_text("y"),
+        ],
+        ..Script::default()
+    };
+    let f = start(vec![script], resume("s-1"));
+    assert_eq!(
+        f.host.history().await.unwrap().events,
+        [user("hello"), msg("答え"), user("x"), user("y")]
+    );
+}
+
 #[cfg(unix)]
 mod process {
     use super::*;
@@ -1163,6 +1318,113 @@ mod process {
             .unwrap()
             .unwrap();
         assert!(matches!(event, E::EngineExited { .. }), "{event:?}");
+    }
+
+    /// pid は起動した child のもの。engine が終了したら None。
+    #[tokio::test]
+    async fn pid_is_the_child_process_and_clears_on_exit() {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&lines);
+        let host = AcpClientHost::spawn(
+            sh("echo \"pid=$$\" >&2; read line; exit 0"),
+            HostOptions {
+                on_stderr: Arc::new(move |line| sink.lock().unwrap().push(line.to_string())),
+                ..HostOptions::default()
+            },
+        )
+        .expect("起動");
+        let pid = host.pid().expect("起動した時点で pid が読める");
+        tokio::time::timeout(WAIT, async {
+            while lines.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("stderr の行");
+        assert_eq!(*lines.lock().unwrap(), [format!("pid={pid}")]);
+        // initialize の行を読んだ sh が終了する
+        assert!(
+            tokio::time::timeout(WAIT, host.history())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(host.pid(), None);
+    }
+
+    /// stderr は 1 行ごとに呼び手に渡す。空行は渡さず、UTF-8 でない byte は置き換える。
+    /// 改行で終わらない最後の行も渡す。終了の文に付ける末尾は今までどおり。
+    #[tokio::test]
+    async fn stderr_lines_reach_the_caller() {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&lines);
+        let host = AcpClientHost::spawn(
+            sh("printf 'one\\n\\n  two\\r\\n\\377x\\nlast' >&2; exit 3"),
+            HostOptions {
+                on_stderr: Arc::new(move |line| sink.lock().unwrap().push(line.to_string())),
+                ..HostOptions::default()
+            },
+        )
+        .expect("起動");
+        let error = tokio::time::timeout(WAIT, host.history())
+            .await
+            .unwrap()
+            .unwrap_err();
+        tokio::time::timeout(WAIT, async {
+            while lines.lock().unwrap().len() < 4 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("stderr の行: {:?}", lines.lock().unwrap()));
+        assert_eq!(
+            *lines.lock().unwrap(),
+            ["one", "  two", "\u{FFFD}x", "last"]
+        );
+        assert!(
+            matches!(&error, HostError::Establish(m) if m.contains("last")),
+            "{error:?}"
+        );
+    }
+
+    /// 立て直しの後、前の process が遅れて書いた stderr は、新しい process の分に混ざらない。
+    /// 前の process の孫が stderr を握ったまま、親が止められた後に書く場面で確かめる。
+    #[tokio::test]
+    async fn stderr_of_the_previous_process_does_not_leak_into_the_next() {
+        use agent_chat_acp::ProcessConnector;
+        let marker = std::env::temp_dir().join(format!("acp-stderr-leak-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!(
+            "if [ -e '{m}' ]; then echo from-new >&2; exec sleep 30; \
+             else : > '{m}'; (sleep 0.3; echo late-from-old >&2) & exec sleep 30; fi",
+            m = marker.display()
+        );
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&lines);
+        let mut connector = ProcessConnector::new(sh(&script)).on_stderr(Arc::new(move |line| {
+            sink.lock().unwrap().push(line.to_string())
+        }));
+
+        let old = connector.connect().expect("1 つ目");
+        // 1 つ目が動き出して孫を起こすまで待つ（すぐ止めると、script が走る前に終わる）
+        tokio::time::timeout(WAIT, async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("1 つ目の process が動き出す");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        connector.shutdown();
+        drop(old);
+        let new = connector.connect().expect("2 つ目");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        assert_eq!(connector.stderr_tail(), "from-new");
+        assert_eq!(*lines.lock().unwrap(), ["from-new"]);
+        connector.shutdown();
+        drop(new);
+        let _ = std::fs::remove_file(&marker);
     }
 }
 

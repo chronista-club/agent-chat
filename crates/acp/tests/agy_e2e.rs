@@ -219,7 +219,11 @@ async fn e2e_new_turn_then_load_and_restart_restore_history() {
     );
 
     let started = Instant::now();
+    let pid_before = host.pid().expect("実機の process の pid");
     let restarted = host.restart().await.expect("立て直し");
+    let pid_after = host.pid().expect("立て直した process の pid");
+    println!("pid: {pid_before} → {pid_after}");
+    assert_ne!(pid_before, pid_after, "立て直しで process が替わる");
     println!("立て直しで確定まで {:?}", started.elapsed());
     assert_eq!(restarted.events, loaded.events);
 

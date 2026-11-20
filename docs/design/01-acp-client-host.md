@@ -141,7 +141,7 @@ VP に残すもの:
 - **`restart()` が `Busy` なら**、turn を中断するか終わりを待ってから呼び直す
 - **`restart()` が `Establish` / `Dead` を返したら、host は終了している**（`LoadFallback::Fail` で load に失敗した時、起動できなかった時など）。`EngineExited` も出る。その host はもう使えないので、呼び手が作り直す（`spawn` し直す）。`history()` / `submit()` も同じ Err を返す
 - **chat を開く時は `attach()`**。`history()` と `subscribe()` を別々に呼ばない
-- **`permission` と `on_session` に重い処理を置かない**（接続全体が止まる）
+- **`permission` と `on_session` に重い処理を置かない**（接続全体が止まる）。`on_stderr` も同じく軽くする（こちらは stderr を読む task の中で呼ばれる）
 
 #### load の流れの読み切り
 
@@ -164,7 +164,11 @@ host は、`start_session()` が返った時点で stream に溜まっている�
 
 訳し方:
 - **turn の区切り**: `user_message_chunk` が来たら新しい turn が始まったとみなす。履歴には `TurnCompleted` を入れない（VP の replay と同じ。終わりは `ReplayEnd` が下ろす）
-- **user の発話**: `user_message_chunk` を `UserMessage` にする。続けて来ても 1 つにまとめない（agy の実測は 1 発話 1 chunk で、messageId が無いので、同じ発話の続きか別の発話かを見分けられない。答えの無いまま次の発話が来る並びも実測にある）
+- **user の発話**: `user_message_chunk` を `UserMessage` にする
+  - `messageId` が付いていて、直前の chunk と同じなら、同じ発話の続きとして控えで 1 つにまとめる（opencode 2.3.0 は付ける。VP の acp-stage2 lane の実測、2026-11-20）
+  - `messageId` が無ければ、続けて来ても別の発話にする（agy 1.5.11 は付けない。同じ発話の続きか別の発話かを見分けられない。答えの無いまま次の発話が来る並びも実測にある）
+  - 間に会話の中身（本文・thinking・tool・plan）が挟まったら、同じ id でも続きにしない。usage / session_info などの状態の通知は挟まっても続きのまま（opencode は会話中に `session_info_update` を 1 turn に 20 件ほど流す）
+  - opencode が 1 つの発話を複数の chunk で流す実例は、まだ取れていない（実測は 1 発話 1 chunk）。まとめる処理は偽の agent のテストでだけ確かめている
 - **本文と thinking**: 続く chunk は控えの中で 1 件にまとめる
 - **tool**: `tool_call` の status が completed / failed なら、`ToolCall` と `ToolCallUpdate` の 2 つにする。会話中も同じ規則
 - **履歴に入れないもの**: usage / commands / 設定 / session_info は状態として持つだけ（今と同じ）
@@ -195,6 +199,10 @@ VP の `AcpAgentHost` に近い形にして、Stage 2 の差し替えを小さ�
 - `attach()`: 控えへの追加と event の送信を同じ lock の中で行うので、控えに入った event は受け口に出ず、控えに無い event は必ず受け口に出る。`history()` と `subscribe()` を別々に呼ぶと、その間の event が重なるか抜ける
 - 設定の意図: 会話中の `set_config` が成功したら、その値を今の意図として覚える。`restart()` の後の当て直しは今の意図から行う（起動の時の `config_intent` に戻さない）
 - `restart()` が `Busy` を返すのは、turn の最中・送っていない発話がある時・設定の切替の応答を待っている時
+- `pid()`: engine の process の pid。`restart()` で process が替わったら新しい pid、engine が終了したら None。process を持たない `Connector` は None（VP は chat engine の pid を lane の実体の印に使う）
+- `HostOptions::on_stderr`: engine の stderr を 1 行ごとに受け取る関数（既定は何もしない）。空行は渡さず、UTF-8 でない byte は置き換える。改行の無い出力は 8 KiB で区切って渡す。終了の文に付ける末尾 4 KB の保持は別に続けている。8 KiB で区切る時は文字の途中で切れて、置き換え文字が 1 つ入ることがある（log 用なので許容）。接続のたびに末尾の buffer を新しくし、前の process の読み手を止めるので、立て直しの後に前の process（やその孫）が遅れて書いた分は、新しい process の末尾にも `on_stderr` にも混ざらない。`spawn_with` で自前の connector を渡す時は、`ProcessConnector::on_stderr` で渡す
+- 確定の前に接続が切れたら `Establish`、確定の後なら `Dead`。engine が initialize を読む前に終了した時、切れ方は OS と時機で変わる（EOF が先か、書き込みの `Broken pipe` が先か）が、どちらでも `Establish` で返す
+- 終了の文に付ける stderr の末尾は、stderr の読み切りを 1 秒まで待ってから取る（engine が終了した直後は、最後に書いた分をまだ読んでいないことがある）。`restart()` と `stop()` では待たない
 - アプリが渡した関数（`on_session` / `permission`）が panic して host の task が落ちても、待っている呼び手は `Dead` を受け取り、`EngineExited` が出る
 
 ```rust
@@ -219,6 +227,8 @@ pub struct HostOptions {
     pub config_intent: Vec<(String, String)>,
     pub permission: Arc<dyn Fn(&RequestPermissionRequest) -> PermissionDecision + Send + Sync>,
     pub on_session: Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>,
+    /// engine の stderr を 1 行ごとに受け取る（既定は何もしない）
+    pub on_stderr: Arc<dyn Fn(&str) + Send + Sync>,
     /// 控えの上限（既定は CodexHistory と同じ: 1 MiB / 800 event / 1 件 32 KiB）
     pub history_limits: HistoryLimits,
 }
@@ -233,6 +243,8 @@ impl AcpClientHost {
     pub async fn set_config(&self, id: &str, value: &str) -> Result<Vec<AcpConfigOption>>;
     pub fn config_view(&self) -> Option<AcpConfigView>;
     pub fn session_init(&self) -> Option<ConversationEvent>;
+    /// engine の process の pid（process を持たない connector と、終了の後は None）
+    pub fn pid(&self) -> Option<u32>;
     /// 履歴の控え。会話の確定まで待つ。呼び手が ReplayStart 〜 ReplayEnd で包む
     pub async fn history(&self) -> Result<HistorySnapshot>;
     /// 控えと、その続きの event の受け口を一緒に取る（turn の最中に開き直す時）
@@ -296,9 +308,9 @@ prompt の応答は `TurnCompleted` にする（context の使用量を載せる
 
 1. crate `crates/acp`（`agent-chat-acp`）。agent-chat の gate（fmt / clippy `-D warnings` / `test --all-features` / 生成物の drift）に乗っている
 2. calculations: 翻訳・設定・付随情報・permission・履歴の控え。fixture は VP design 88 §1・§6 の実測 wire（agy 1.5.9）と、今回の実測の形（agy 1.5.11）
-3. 偽の agent のテスト（`tests/fake_agent.rs`、27 本）
+3. 偽の agent のテスト（`tests/fake_agent.rs`、34 本）
    - 相手は SDK の `Channel::duplex()` の片側で、生の JSON-RPC を台本どおりに返す。SDK の `Agent.v1()` は使わなかった（load の応答の前後に通知を置く順序を、生の方が直接書ける）
-   - 場面: 新規の turn / load の流れが履歴になる / turn の最中の `history()` と中断 / 発話の写し / `restart()` / load の失敗（既定と新規）/ 待ちの上限 / 設定の当て直しと切替 / 知らない update / EOF / prompt の error / permission の方針 / 発話の順送りと画像 / `SessionInit` の保留 / 会話 ID の callback / 控えの上限 / 会話中に切り替えた設定が立て直しの後も残る / 立て直しの失敗 / 渡した関数の panic / `stop()` / 他の書き手の発話 / `attach()` / process の起動の失敗と stderr の末尾 / 設定の当て直しに答えない engine
+   - 場面: 新規の turn / load の流れが履歴になる / turn の最中の `history()` と中断 / 発話の写し / `restart()` / load の失敗（既定と新規）/ 待ちの上限 / 設定の当て直しと切替 / 知らない update / EOF / prompt の error / permission の方針 / 発話の順送りと画像 / `SessionInit` の保留 / 会話 ID の callback / 控えの上限 / 会話中に切り替えた設定が立て直しの後も残る / 立て直しの失敗 / 渡した関数の panic / `stop()` / 他の書き手の発話 / `attach()` / process の起動の失敗と stderr の末尾 / 設定の当て直しに答えない engine / pid / stderr の行渡し / 同じ messageId の発話 / 確定の前に接続が切れる場面
 4. 実機 E2E（`tests/agy_e2e.rs`、`#[ignore]`、4 本 + 実物の会話を load して数える 1 本）: agy 1.5.11、model は `gemini-3.8-flash`
 5. VP の `AcpAgentHost` との比較（「VP の手書きの host との比較」の節）
 
@@ -391,6 +403,7 @@ load の流れ（VP lead の実測）:
 ### リスク
 
 - **`serde_json` の `preserve_order`**: SDK（`agent-client-protocol` 5.3.0 と `agent-client-protocol-schema` 1.18.0）が有効にする（`cargo tree -e features -i serde_json` で確認）。feature は build 全体で 1 つにまとまるので、この crate に依存する binary では `serde_json::Value` の key の順が「辞書順」から「入れた順」に変わる。agent-chat の中では、protocol の fixture の key を辞書順に書いて生成物を変えないようにした。consumer への影響（JSON の文字列を比べている所）は Stage 2 の前に consumer 側で調べる
+- **SDK の版は consumer の lock で決まる**: path 依存は agent-chat の `Cargo.lock` を連れていかない。consumer が何もしないと新しい版（5.4.0 / schema 1.19.0 など）を引く。VP は lock で 5.3.0 / 1.18.0 に揃えている。agent-chat が版を上げる時は consumer に知らせる
 - **SDK の版の追従**: 5.x で、schema は `=` で固定され、minor の版でも動く。unstable の feature は使わない。版は workspace の 1 か所で持つ
 - **境界**: process を共有側が持つ最初の host になる。load の失敗の扱いが、VP の今（黙って新規）と design 86（変換しない）で食い違う。方針を注入にして既定は `Fail`、VP は `NewSession` を渡す
 - **GFP**: crate を分けるので、GFP が依存するまで build に影響しない
