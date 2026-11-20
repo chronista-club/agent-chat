@@ -41,6 +41,8 @@ use crate::translate::AcpTranslator;
 
 /// stderr の 1 行として溜める上限。超えたら改行を待たずに渡す。
 const STDERR_LINE_BYTES: usize = 8192;
+/// `stop()` で止めた時の文。
+const STOPPED: &str = "停止しました";
 /// engine の終了の後、stderr の読み切りを待つ上限。孫 process が stderr を握ったままでも待ち続けない。
 const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// 保持する stderr の末尾の大きさ。
@@ -338,6 +340,9 @@ struct Shared {
     session_init: Option<ConversationEvent>,
     /// 今の接続の process の pid。
     pid: Option<u32>,
+    /// 受け取ってまだ送っていない発話の数。接続がどの経路で終わっても、送られなかった数を
+    /// 知らせられるように、命令の loop の外から読める所に持つ。
+    queued: usize,
 }
 
 struct Ctx {
@@ -345,10 +350,20 @@ struct Ctx {
     options: HostOptions,
     events: broadcast::Sender<ConversationEvent>,
     phase: watch::Sender<Phase>,
+    /// 止める合図。命令の queue とは別に持つ: 会話の確定や設定の当て直しを待っている最中でも
+    /// すぐ届き、先に積まれた発話より先に効く。
+    stop: watch::Sender<bool>,
     shared: Mutex<Shared>,
 }
 
 impl Ctx {
+    /// 止める合図が出るまで待つ。
+    async fn stopped(&self) {
+        let mut stop = self.stop.subscribe();
+        // Sender は Ctx が持っているので、待っている間に閉じることは無い。
+        let _ = stop.wait_for(|stopped| *stopped).await;
+    }
+
     fn emit(&self, event: ConversationEvent) {
         // 受け手がいない時の Err は捨てる（購読は任意）。
         let _ = self.events.send(event);
@@ -400,7 +415,6 @@ enum Command {
     Restart {
         reply: Reply<HistorySnapshot>,
     },
-    Stop,
 }
 
 /// 接続 1 本の終わり方。
@@ -436,11 +450,13 @@ impl AcpClientHost {
         let transport = connector.connect().map_err(HostError::Spawn)?;
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let (phase, _) = watch::channel(Phase::Starting);
+        let (stop, _) = watch::channel(false);
         let (commands, command_rx) = mpsc::unbounded_channel();
         let ctx = Arc::new(Ctx {
             cwd,
             events,
             phase,
+            stop,
             shared: Mutex::new(Shared {
                 session_id: None,
                 model: None,
@@ -455,6 +471,7 @@ impl AcpClientHost {
                 in_turn: false,
                 session_init: None,
                 pid: connector.pid(),
+                queued: 0,
             }),
             options,
         });
@@ -574,9 +591,16 @@ impl AcpClientHost {
         rx.await.map_err(|_| self.dead())?
     }
 
-    /// engine を止める。
+    /// host が終了したか（engine の終了、確定の失敗、`stop()`）。待たずに読める。
+    /// true なら、この host はもう使えない。呼び手が作り直す。立て直しの途中は false。
+    pub fn is_finished(&self) -> bool {
+        matches!(*self.ctx.phase.borrow(), Phase::Failed(_))
+    }
+
+    /// engine を止める。会話の確定や設定の当て直しを待っている最中でも、すぐに process を止める。
+    /// 先に `submit` していてまだ送っていない発話は、送らずに捨てる。
     pub fn stop(&self) {
-        let _ = self.commands.send(Command::Stop);
+        self.ctx.stop.send_replace(true);
     }
 
     fn send(&self, command: Command) -> Result<(), HostError> {
@@ -641,12 +665,8 @@ async fn supervise<C: Connector>(
         };
         connector.shutdown();
         ctx.shared().pid = None;
-        if !matches!(exit, Exit::Restart(_) | Exit::Stop) {
-            // 終了の文に stderr の末尾を付ける。最後に書かれた分を読み切ってから取る。
-            let _ = tokio::time::timeout(STDERR_DRAIN_TIMEOUT, connector.stderr_drained()).await;
-        }
-        let error = match exit {
-            Exit::Restart(reply) => {
+        let (early, reason, mut lost) = match exit {
+            Exit::Restart(reply) if !*ctx.stop.borrow() => {
                 // 先に Starting にする。控えを空にした後で Ready のまま読まれないように。
                 ctx.phase.send_replace(Phase::Starting);
                 let mut shared = ctx.shared();
@@ -657,21 +677,64 @@ async fn supervise<C: Connector>(
                 restarting = Some(reply);
                 continue;
             }
-            Exit::Stop => HostError::Dead("停止しました".to_string()),
-            Exit::Establish(message) => {
-                HostError::Establish(with_stderr(message, &connector.stderr_tail()))
+            Exit::Restart(reply) => {
+                restarting = Some(reply);
+                (HostError::Dead(STOPPED.to_string()), None, 0)
             }
-            Exit::Dead(message) => HostError::Dead(with_stderr(message, &connector.stderr_tail())),
+            Exit::Stop => (HostError::Dead(STOPPED.to_string()), None, 0),
+            Exit::Establish(message) => (
+                HostError::Establish(message.clone()),
+                Some(format!("会話を確定できませんでした（{message}）")),
+                0,
+            ),
+            // 受け取ってまだ送っていない発話の数は Shared から読む。接続そのものが失敗で
+            // 終わった時（書き込みの失敗など）は命令の loop が途中で捨てられるので、
+            // loop の返り値では運べない。
+            Exit::Dead(message) => (
+                HostError::Dead(message),
+                Some("engine が終了しました".to_string()),
+                std::mem::take(&mut ctx.shared().queued),
+            ),
         };
+        // ここから先、この host はもう発話を受けない。すぐに `submit` が Err を返し、
+        // `is_finished()` が true になるようにする（stderr の読み切りを待つ前に）。
         ctx.shared().in_turn = false;
-        if !matches!(error, HostError::Dead(ref m) if m == "停止しました") {
-            ctx.emit(ConversationEvent::EngineExited {
-                message: error.to_string(),
-            });
+        ctx.phase.send_replace(Phase::Failed(early.clone()));
+        commands.close();
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                Command::Submit { .. } => lost += 1,
+                Command::Restart { reply } => drop(reply.send(Err(early.clone()))),
+                Command::SetConfig { reply, .. } => drop(reply.send(Err(early.clone()))),
+                Command::Interrupt => {}
+            }
         }
         if let Some(reply) = restarting.take() {
-            let _ = reply.send(Err(error.clone()));
+            let _ = reply.send(Err(early.clone()));
         }
+        let Some(reason) = reason else {
+            return; // stop() で止めた。終了の event は出さない
+        };
+        // 終了の文に stderr の末尾を付ける。最後に書かれた分を読み切ってから取る。
+        let _ = tokio::time::timeout(STDERR_DRAIN_TIMEOUT, connector.stderr_drained()).await;
+        let stderr = connector.stderr_tail();
+        let error = match early {
+            HostError::Establish(message) => HostError::Establish(with_stderr(message, &stderr)),
+            HostError::Dead(message) => HostError::Dead(with_stderr(message, &stderr)),
+            other => other,
+        };
+        // 送られなかった発話は、黙って捨てずに会話に出す。確定の失敗は、待ちが無くても
+        // 理由を出す（`EngineExited` の文を画面に出さない UI でも、理由が見えるように）。
+        if lost > 0 {
+            ctx.emit(ConversationEvent::Error {
+                message: format!("{reason}。待っていた発話 {lost} 件は送られていません"),
+            });
+        } else if matches!(error, HostError::Establish(_)) {
+            ctx.emit(ConversationEvent::Error { message: reason });
+        }
+        ctx.emit(ConversationEvent::EngineExited {
+            message: error.to_string(),
+        });
         ctx.phase.send_replace(Phase::Failed(error));
         return;
     }
@@ -711,9 +774,15 @@ async fn run_connection(
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(transport, async |cx: ConnectionTo<Agent>| {
-            let establish =
-                tokio::time::timeout(ctx.options.establish_timeout, establish(&cx, ctx, resume))
-                    .await;
+            // 確定を待っている最中でも、止める合図が来たらすぐ抜ける（process は呼び元が止める）。
+            let establish = tokio::select! {
+                biased;
+                () = ctx.stopped() => return Ok(Exit::Stop),
+                result = tokio::time::timeout(
+                    ctx.options.establish_timeout,
+                    establish(&cx, ctx, resume),
+                ) => result,
+            };
             let mut conn = match establish {
                 Ok(Ok(conn)) => conn,
                 Ok(Err(message)) => return Ok(Exit::Establish(message)),
@@ -728,7 +797,11 @@ async fn run_connection(
             // host は止めず、設定面に失敗の文を残して発話を流す）。発話は当て直しの後に送る。
             established.store(true, std::sync::atomic::Ordering::Relaxed);
             ctx.phase.send_replace(Phase::Ready);
-            reapply_config(&cx, ctx, &conn.session_id).await;
+            tokio::select! {
+                biased;
+                () = ctx.stopped() => return Ok(Exit::Stop),
+                () = reapply_config(&cx, ctx, &conn.session_id) => {}
+            }
             if let Some(init) = ctx.build_session_init() {
                 ctx.emit(init);
             }
@@ -914,8 +987,10 @@ impl Connection {
         let mut config_pending = 0usize;
         loop {
             tokio::select! {
-                // engine からの流れを先に読み切る（EOF より前に届いた分を落とさない）。
+                // 止める合図が先。先に積まれた発話があっても、送らずに止める。
+                // 次に engine からの流れを読み切る（EOF より前に届いた分を落とさない）。
                 biased;
+                () = ctx.stopped() => return Exit::Stop,
                 message = self.session.read_update() => match message {
                     Ok(message) => self.on_message(ctx, message, false),
                     Err(e) => return Exit::Dead(e.to_string()),
@@ -942,10 +1017,14 @@ impl Connection {
                     let _ = done.reply.send(done.result.map_err(HostError::Engine));
                 }
                 command = commands.recv() => match command {
-                    None | Some(Command::Stop) => return Exit::Stop,
+                    // 送り手（host）が無くなった。drop は止める合図も出すので、普通は上の枝で抜ける。
+                    None => return Exit::Stop,
                     Some(Command::Submit { text, images }) => {
                         self.queue.push_back((text, images));
+                        ctx.shared().queued = self.queue.len();
                         if let Err(message) = self.send_next(ctx) {
+                            // 送れなかった 1 件も、送られなかった数に入れる。
+                            ctx.shared().queued = self.queue.len() + 1;
                             return Exit::Dead(message);
                         }
                     }
@@ -954,6 +1033,7 @@ impl Connection {
                         // （VP の codex / vpcode / 手書きの ACP の host と同じ）。捨てた発話は
                         // まだ送っていないので、控えにも入っていない。
                         self.queue.clear();
+                        ctx.shared().queued = 0;
                         if self.in_turn
                             && let Err(e) = cx.send_notification(CancelNotification::new(
                                 self.session_id.clone(),
@@ -1022,6 +1102,7 @@ impl Connection {
         self.in_turn = true;
         let mut shared = ctx.shared();
         shared.in_turn = true;
+        shared.queued = self.queue.len();
         // 控えには送信の時の text を入れる。engine が返す写しには頼らない。
         shared.history.push(ConversationEvent::UserMessage { text });
         Ok(())
@@ -1156,6 +1237,11 @@ impl Connection {
             context_window: usage.map(|(_, size)| size),
         });
         drop(shared);
+        // 接続が切れた後は、待ちの発話を送らない（送っても届かない。待ちのまま残して、
+        // 終了の時に「送られていない」と知らせる）。
+        if self.session.connection().is_incoming_closed() {
+            return;
+        }
         if let Err(message) = self.send_next(ctx) {
             ctx.emit(ConversationEvent::Error { message });
         }
