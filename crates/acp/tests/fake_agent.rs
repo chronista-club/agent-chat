@@ -39,6 +39,8 @@ struct Turn {
 struct Script {
     /// initialize に答えない。
     hang: bool,
+    /// 何も読まずに接続を閉じる（起動してすぐ終了した engine）。
+    gone: bool,
     /// load の応答の前に流す update。
     replay: Vec<Value>,
     /// load の応答の後に流す update。
@@ -70,6 +72,9 @@ async fn fake_agent(mut peer: Channel, mut script: Script, log: Log) {
         .expect("update");
         let _ = peer.tx.unbounded_send(TransportFrame::Single(message));
     };
+    if script.gone {
+        return;
+    }
     let mut session = "new-1".to_string();
     let mut pending_prompt = None;
     let mut pending_permission = None;
@@ -1113,6 +1118,95 @@ async fn restart_is_busy_while_a_turn_is_queued() {
     assert_eq!(f.host.restart().await, Err(HostError::Busy));
     f.host.interrupt().unwrap();
     f.until_turn_end().await;
+}
+
+/// 会話が確定する前に接続が切れたら、確定の失敗として返す（確定の後の終了とは分ける）。
+/// 切れ方（EOF が先か、書き込みの失敗が先か）は OS と時機で変わる。
+#[tokio::test]
+async fn connection_lost_before_establish_is_an_establish_error() {
+    for _ in 0..20 {
+        let f = start(
+            vec![Script {
+                gone: true,
+                ..Script::default()
+            }],
+            HostOptions::default(),
+        );
+        let error = tokio::time::timeout(WAIT, f.host.history())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, HostError::Establish(_)), "{error:?}");
+    }
+}
+
+/// 書き込みが必ず `Broken pipe` になり、何も読めない接続（initialize を読む前に終了した engine を、
+/// 時機に頼らずに再現する。Linux の CI では実 process でこの切れ方になった）。
+struct BrokenPipe;
+
+impl futures::AsyncWrite for BrokenPipe {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        _: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+    }
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl futures::AsyncRead for BrokenPipe {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        _: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Pending
+    }
+}
+
+struct BrokenPipeConnector;
+
+impl Connector for BrokenPipeConnector {
+    type Transport = agent_client_protocol::ByteStreams<BrokenPipe, BrokenPipe>;
+    fn connect(&mut self) -> Result<Self::Transport, String> {
+        Ok(agent_client_protocol::ByteStreams::new(
+            BrokenPipe, BrokenPipe,
+        ))
+    }
+    fn stderr_tail(&self) -> String {
+        "engine の最後の言葉".to_string()
+    }
+}
+
+/// 確定の前に書き込みが失敗して接続が切れても、確定の失敗として返す。stderr の末尾も付く。
+#[tokio::test]
+async fn write_failure_before_establish_is_an_establish_error() {
+    let host = AcpClientHost::spawn_with(
+        BrokenPipeConnector,
+        PathBuf::from("/work"),
+        HostOptions::default(),
+    )
+    .expect("起動");
+    let error = tokio::time::timeout(WAIT, host.history())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(&error, HostError::Establish(m) if m.contains("engine の最後の言葉")),
+        "{error:?}"
+    );
 }
 
 /// process を持たない connector の pid は None。持つなら、立て直しで新しい pid に替わる。

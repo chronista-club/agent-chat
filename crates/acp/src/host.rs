@@ -665,6 +665,8 @@ async fn run_connection(
     restarting: &mut Option<Reply<HistorySnapshot>>,
 ) -> Exit {
     let policy = Arc::clone(&ctx.options.permission);
+    // 会話が確定したか。接続そのものの失敗（書き込みの失敗など）を、確定の前後で分けて返す。
+    let established = std::sync::atomic::AtomicBool::new(false);
     let result = Client
         .v1()
         .on_receive_request(
@@ -695,6 +697,7 @@ async fn run_connection(
             };
             // 会話はここで確定。設定の当て直しは確定の上限に数えない（遅くても失敗しても
             // host は止めず、設定面に失敗の文を残して発話を流す）。発話は当て直しの後に送る。
+            established.store(true, std::sync::atomic::Ordering::Relaxed);
             ctx.phase.send_replace(Phase::Ready);
             reapply_config(&cx, ctx, &conn.session_id).await;
             if let Some(init) = ctx.build_session_init() {
@@ -706,7 +709,14 @@ async fn run_connection(
             Ok(conn.run(&cx, ctx, commands).await)
         })
         .await;
-    result.unwrap_or_else(|e| Exit::Dead(e.to_string()))
+    result.unwrap_or_else(|e| {
+        if established.load(std::sync::atomic::Ordering::Relaxed) {
+            Exit::Dead(e.to_string())
+        } else {
+            // 例: engine が initialize を読む前に終了し、書き込みが Broken pipe になった。
+            Exit::Establish(e.to_string())
+        }
+    })
 }
 
 /// 確定した接続の状態（命令のループが持つ）。
