@@ -39,6 +39,8 @@ use crate::session_meta::{
 };
 use crate::translate::AcpTranslator;
 
+/// stderr の 1 行として溜める上限。超えたら改行を待たずに渡す。
+const STDERR_LINE_BYTES: usize = 8192;
 /// 保持する stderr の末尾の大きさ。
 const STDERR_TAIL_BYTES: usize = 4096;
 const EVENT_CAPACITY: usize = 1024;
@@ -69,6 +71,7 @@ pub enum LoadFallback {
 pub type PermissionPolicy =
     Arc<dyn Fn(&RequestPermissionRequest) -> PermissionDecision + Send + Sync>;
 pub type SessionCallback = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+pub type StderrCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// host の注入点。
 #[derive(Clone)]
@@ -87,6 +90,10 @@ pub struct HostOptions {
     pub permission: PermissionPolicy,
     /// 会話が確定した時に sessionId を受け取る（アプリの永続化）。Err は `Error` event で出す。
     pub on_session: SessionCallback,
+    /// engine の stderr を 1 行ごとに受け取る（log に出す等）。空行は来ない。UTF-8 でない byte は
+    /// 置き換える。重い処理をしない。既定は何もしない。[`AcpClientHost::spawn`] で起動した
+    /// process にだけ効く（[`AcpClientHost::spawn_with`] では connector の側で渡す）。
+    pub on_stderr: StderrCallback,
     pub history_limits: HistoryLimits,
 }
 
@@ -100,6 +107,7 @@ impl Default for HostOptions {
             config_intent: Vec::new(),
             permission: Arc::new(permission::allow),
             on_session: Arc::new(|_| Ok(())),
+            on_stderr: Arc::new(|_| {}),
             history_limits: HistoryLimits::default(),
         }
     }
@@ -151,13 +159,20 @@ pub trait Connector: Send + 'static {
     fn stderr_tail(&self) -> String {
         String::new()
     }
+    /// 今の接続の process の pid。process を持たない connector は None。
+    fn pid(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// process を起動して stdio をつなぐ。
 pub struct ProcessConnector {
     launch: LaunchContext,
     child: Option<Child>,
+    /// 起動した時の pid（`Child::id` は終了を回収した後 None になるので、起動の時に控える）。
+    pid: Option<u32>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    on_stderr: StderrCallback,
 }
 
 impl ProcessConnector {
@@ -165,8 +180,26 @@ impl ProcessConnector {
         Self {
             launch,
             child: None,
+            pid: None,
             stderr: Arc::default(),
+            on_stderr: Arc::new(|_| {}),
         }
+    }
+
+    /// stderr を 1 行ごとに受け取る関数を渡す（[`HostOptions::on_stderr`] と同じ決まり）。
+    #[must_use]
+    pub fn on_stderr(mut self, on_stderr: StderrCallback) -> Self {
+        self.on_stderr = on_stderr;
+        self
+    }
+}
+
+/// stderr の 1 行を呼び手に渡す。行末の改行を落とし、空行は渡さない。
+fn emit_stderr_line(on_stderr: &StderrCallback, line: &[u8]) {
+    let line = String::from_utf8_lossy(line);
+    let line = line.trim_end_matches(['\r', '\n']);
+    if !line.trim().is_empty() {
+        on_stderr(line);
     }
 }
 
@@ -194,24 +227,44 @@ impl Connector for ProcessConnector {
         if let Some(mut stderr) = child.stderr.take() {
             let tail = Arc::clone(&self.stderr);
             tail.lock().expect("stderr lock").clear();
+            let on_stderr = Arc::clone(&self.on_stderr);
             tokio::spawn(async move {
                 let mut buf = [0u8; 1024];
+                // 改行が来るまでの読みかけの 1 行。
+                let mut line = Vec::new();
                 while let Ok(n) = stderr.read(&mut buf).await {
                     if n == 0 {
                         break;
                     }
-                    let mut tail = tail.lock().expect("stderr lock");
-                    tail.extend_from_slice(&buf[..n]);
-                    let over = tail.len().saturating_sub(STDERR_TAIL_BYTES);
-                    tail.drain(..over);
+                    {
+                        let mut tail = tail.lock().expect("stderr lock");
+                        tail.extend_from_slice(&buf[..n]);
+                        let over = tail.len().saturating_sub(STDERR_TAIL_BYTES);
+                        tail.drain(..over);
+                    }
+                    line.extend_from_slice(&buf[..n]);
+                    while let Some(end) = line.iter().position(|b| *b == b'\n') {
+                        let rest = line.split_off(end + 1);
+                        emit_stderr_line(&on_stderr, &line);
+                        line = rest;
+                    }
+                    // 改行の無い出力が続いても溜め込まない。
+                    if line.len() > STDERR_LINE_BYTES {
+                        emit_stderr_line(&on_stderr, &line);
+                        line.clear();
+                    }
                 }
+                // 改行で終わらなかった最後の行。
+                emit_stderr_line(&on_stderr, &line);
             });
         }
+        self.pid = child.id();
         self.child = Some(child);
         Ok(ByteStreams::new(stdin.compat_write(), stdout.compat()))
     }
 
     fn shutdown(&mut self) {
+        self.pid = None;
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
             // 終了を回収する。runtime の外（drop）なら kill_on_drop に任せる。
@@ -227,6 +280,10 @@ impl Connector for ProcessConnector {
         String::from_utf8_lossy(&self.stderr.lock().expect("stderr lock"))
             .trim()
             .to_string()
+    }
+
+    fn pid(&self) -> Option<u32> {
+        self.pid
     }
 }
 
@@ -255,6 +312,8 @@ struct Shared {
     history: History,
     in_turn: bool,
     session_init: Option<ConversationEvent>,
+    /// 今の接続の process の pid。
+    pid: Option<u32>,
 }
 
 struct Ctx {
@@ -340,7 +399,8 @@ impl AcpClientHost {
     /// process を起動し、initialize → `session/load`（resume あり）か `session/new` を始める。
     pub fn spawn(launch: LaunchContext, options: HostOptions) -> Result<Self, HostError> {
         let cwd = launch.cwd.clone();
-        Self::spawn_with(ProcessConnector::new(launch), cwd, options)
+        let connector = ProcessConnector::new(launch).on_stderr(Arc::clone(&options.on_stderr));
+        Self::spawn_with(connector, cwd, options)
     }
 
     /// 接続の作り方を差し替えて起動する。
@@ -370,6 +430,7 @@ impl AcpClientHost {
                 history: History::new(options.history_limits),
                 in_turn: false,
                 session_init: None,
+                pid: connector.pid(),
             }),
             options,
         });
@@ -425,6 +486,12 @@ impl AcpClientHost {
             options: shared.config.clone()?,
             error: shared.config_error.clone(),
         })
+    }
+
+    /// engine の process の pid。`restart()` で process が替わったら新しい pid。
+    /// engine が終了した後と、process を持たない connector では None。
+    pub fn pid(&self) -> Option<u32> {
+        self.ctx.shared().pid
     }
 
     /// 最後に出した `SessionInit`（開き直しで配り直す用）。
@@ -535,6 +602,7 @@ async fn supervise<C: Connector>(
     loop {
         let exit = match transport.take().map_or_else(|| connector.connect(), Ok) {
             Ok(transport) => {
+                ctx.shared().pid = connector.pid();
                 run_connection(
                     transport,
                     &ctx,
@@ -547,6 +615,7 @@ async fn supervise<C: Connector>(
             Err(message) => Exit::Establish(message),
         };
         connector.shutdown();
+        ctx.shared().pid = None;
         let error = match exit {
             Exit::Restart(reply) => {
                 // 先に Starting にする。控えを空にした後で Ready のまま読まれないように。
@@ -966,6 +1035,25 @@ impl Connection {
                 shared.model = Some(model);
             }
             shared.config = Some(options);
+            return;
+        }
+        if let Some(chunk) = self.translator.ingest_user_chunk(update) {
+            // host が出した発話の写し。UI は送信の時に表示済みで、控えにも入れてある。
+            if !replay && self.in_turn {
+                return;
+            }
+            let mut shared = ctx.shared();
+            if chunk.continues {
+                // 同じ messageId の続き。控えでは 1 つの発話にする。
+                shared.history.extend_user(&chunk.text);
+            } else {
+                shared.history.push(ConversationEvent::UserMessage {
+                    text: chunk.text.clone(),
+                });
+            }
+            if !replay {
+                ctx.emit(ConversationEvent::UserMessage { text: chunk.text });
+            }
             return;
         }
         for event in self.translator.ingest(update) {

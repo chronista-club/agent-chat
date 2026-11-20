@@ -111,6 +111,39 @@ impl History {
         self.enforce();
     }
 
+    /// 同じ発話の続き（同じ `messageId` の `user_message_chunk`）を、直前の user の発話に足す。
+    /// 直前が user の発話でなければ、新しい発話として入れる。
+    pub fn extend_user(&mut self, text: &str) {
+        use ConversationEvent as E;
+        let max = self.limits.max_item_bytes;
+        let last = self.turns.back_mut().and_then(|turn| {
+            let size = turn.sizes.last_mut()?;
+            match turn.events.last_mut()? {
+                E::UserMessage { text: kept } => {
+                    kept.push_str(text);
+                    let cut = trim_text(kept, max);
+                    let after = serde_json::to_vec(&E::UserMessage { text: kept.clone() })
+                        .expect("ConversationEvent は serialize できる")
+                        .len();
+                    let before = std::mem::replace(size, after);
+                    turn.bytes = turn.bytes - before + after;
+                    Some((before, after, cut))
+                }
+                _ => None,
+            }
+        });
+        match last {
+            Some((before, after, cut)) => {
+                self.bytes = self.bytes - before + after;
+                self.truncated |= cut;
+                self.enforce();
+            }
+            None => self.push(E::UserMessage {
+                text: text.to_string(),
+            }),
+        }
+    }
+
     /// 続く chunk を、直前の同じ種類の 1 件に足す。足したら true。
     fn merge_chunk(&mut self, event: &ConversationEvent) -> bool {
         use ConversationEvent as E;
@@ -448,5 +481,38 @@ mod tests {
             .sum();
         assert!(size <= 4096, "{size}");
         assert!(snap.truncated && !snap.events.is_empty());
+    }
+
+    /// 同じ発話の続き（messageId が同じ chunk）は、直前の user の発話に足す。
+    #[test]
+    fn user_continuation_extends_the_last_user_message() {
+        let mut h = History::new(HistoryLimits::default());
+        h.push(user("he"));
+        h.extend_user("llo");
+        h.push(msg("ok"));
+        // 直前が user の発話でなければ、新しい発話として入れる
+        h.extend_user("next");
+        assert_eq!(
+            h.snapshot(false).events,
+            vec![user("hello"), msg("ok"), user("next")]
+        );
+        // 足した分も勘定に入る
+        let limits = HistoryLimits {
+            max_bytes: 200,
+            ..HistoryLimits::default()
+        };
+        let mut h = History::new(limits);
+        h.push(user("old"));
+        h.push(msg("a"));
+        h.push(user("q"));
+        h.extend_user(&"\n".repeat(60));
+        let snap = h.snapshot(false);
+        assert_eq!(
+            snap.events.len(),
+            1,
+            "古い turn が落ちる: {:?}",
+            snap.events
+        );
+        assert!(snap.truncated);
     }
 }
