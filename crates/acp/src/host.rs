@@ -235,8 +235,13 @@ impl Connector for ProcessConnector {
         let stdin = child.stdin.take().ok_or("stdin を取れません")?;
         let stdout = child.stdout.take().ok_or("stdout を取れません")?;
         if let Some(mut stderr) = child.stderr.take() {
+            // 接続のたびに新しい buffer にし、前の読み手を止める。前の process（やその孫）が
+            // 遅れて書いた分が、新しい process の末尾や `on_stderr` に混ざらないように。
+            if let Some(previous) = self.stderr_reader.take() {
+                previous.abort();
+            }
+            self.stderr = Arc::default();
             let tail = Arc::clone(&self.stderr);
-            tail.lock().expect("stderr lock").clear();
             let on_stderr = Arc::clone(&self.on_stderr);
             self.stderr_reader = Some(tokio::spawn(async move {
                 let mut buf = [0u8; 1024];

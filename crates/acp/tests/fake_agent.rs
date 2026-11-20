@@ -1386,6 +1386,46 @@ mod process {
             "{error:?}"
         );
     }
+
+    /// 立て直しの後、前の process が遅れて書いた stderr は、新しい process の分に混ざらない。
+    /// 前の process の孫が stderr を握ったまま、親が止められた後に書く場面で確かめる。
+    #[tokio::test]
+    async fn stderr_of_the_previous_process_does_not_leak_into_the_next() {
+        use agent_chat_acp::ProcessConnector;
+        let marker = std::env::temp_dir().join(format!("acp-stderr-leak-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!(
+            "if [ -e '{m}' ]; then echo from-new >&2; exec sleep 30; \
+             else : > '{m}'; (sleep 0.3; echo late-from-old >&2) & exec sleep 30; fi",
+            m = marker.display()
+        );
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&lines);
+        let mut connector = ProcessConnector::new(sh(&script)).on_stderr(Arc::new(move |line| {
+            sink.lock().unwrap().push(line.to_string())
+        }));
+
+        let old = connector.connect().expect("1 つ目");
+        // 1 つ目が動き出して孫を起こすまで待つ（すぐ止めると、script が走る前に終わる）
+        tokio::time::timeout(WAIT, async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("1 つ目の process が動き出す");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        connector.shutdown();
+        drop(old);
+        let new = connector.connect().expect("2 つ目");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        assert_eq!(connector.stderr_tail(), "from-new");
+        assert_eq!(*lines.lock().unwrap(), ["from-new"]);
+        connector.shutdown();
+        drop(new);
+        let _ = std::fs::remove_file(&marker);
+    }
 }
 
 /// 設定の当て直しに engine が答えなくても、会話は使える。確定の上限には数えない。
