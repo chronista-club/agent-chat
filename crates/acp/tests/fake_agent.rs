@@ -5,6 +5,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -211,6 +212,10 @@ struct FakeConnector {
     log: Log,
     /// process を持つ connector のふりをする時の pid（接続のたびに 1 ずつ増やす）。
     pid: Option<u32>,
+    /// `shutdown` が呼ばれた回数（process を止めたか）。
+    shutdowns: Arc<AtomicUsize>,
+    /// stderr の読み切りにかかる時間。
+    drain: Duration,
 }
 
 impl Connector for FakeConnector {
@@ -225,12 +230,19 @@ impl Connector for FakeConnector {
     fn pid(&self) -> Option<u32> {
         self.pid
     }
+    fn shutdown(&mut self) {
+        self.shutdowns.fetch_add(1, Ordering::SeqCst);
+    }
+    fn stderr_drained(&mut self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(tokio::time::sleep(self.drain))
+    }
 }
 
 struct Fixture {
     host: AcpClientHost,
     events: broadcast::Receiver<E>,
     log: Log,
+    shutdowns: Arc<AtomicUsize>,
 }
 
 fn start(scripts: Vec<Script>, options: HostOptions) -> Fixture {
@@ -238,15 +250,32 @@ fn start(scripts: Vec<Script>, options: HostOptions) -> Fixture {
 }
 
 fn start_with_pid(scripts: Vec<Script>, options: HostOptions, pid: Option<u32>) -> Fixture {
+    start_full(scripts, options, pid, Duration::ZERO)
+}
+
+fn start_full(
+    scripts: Vec<Script>,
+    options: HostOptions,
+    pid: Option<u32>,
+    drain: Duration,
+) -> Fixture {
     let log = Log::default();
+    let shutdowns = Arc::new(AtomicUsize::new(0));
     let connector = FakeConnector {
         scripts: scripts.into(),
         log: Arc::clone(&log),
         pid,
+        shutdowns: Arc::clone(&shutdowns),
+        drain,
     };
     let host = AcpClientHost::spawn_with(connector, PathBuf::from("/work"), options).expect("起動");
     let events = host.subscribe();
-    Fixture { host, events, log }
+    Fixture {
+        host,
+        events,
+        log,
+        shutdowns,
+    }
 }
 
 impl Fixture {
@@ -1124,6 +1153,202 @@ async fn restart_is_busy_while_a_turn_is_queued() {
     f.until_turn_end().await;
 }
 
+impl Fixture {
+    /// process が止められる（`shutdown` が呼ばれる）まで待つ。
+    async fn until_shutdown(&self, within: Duration) {
+        tokio::time::timeout(within, async {
+            while self.shutdowns.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("process が止められない");
+    }
+}
+
+/// `stop()` は、会話の確定を待っている最中でも、すぐに process を止める。
+#[tokio::test]
+async fn stop_before_establish_stops_the_process_at_once() {
+    let f = start(
+        vec![Script {
+            hang: true,
+            ..Script::default()
+        }],
+        HostOptions::default(), // 確定の上限は 30 秒
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    f.host.stop();
+    f.until_shutdown(Duration::from_secs(1)).await;
+    assert!(f.host.is_finished());
+    assert!(matches!(f.host.history().await, Err(HostError::Dead(_))));
+}
+
+/// 設定の当て直しを待っている最中の `stop()` も、すぐに process を止める。
+#[tokio::test]
+async fn stop_during_config_reapply_stops_the_process_at_once() {
+    let f = start(
+        vec![Script {
+            config: config(),
+            config_hang: true,
+            ..Script::default()
+        }],
+        HostOptions {
+            config_intent: vec![("model".into(), "b".into())],
+            ..HostOptions::default() // 当て直しの上限は 15 秒
+        },
+    );
+    f.host.history().await.unwrap();
+    assert!(!f.host.is_finished());
+    f.host.stop();
+    f.until_shutdown(Duration::from_secs(1)).await;
+}
+
+/// host を drop しても同じ。確定の前でも process を残さない。
+#[tokio::test]
+async fn dropping_the_host_before_establish_stops_the_process() {
+    let Fixture {
+        host, shutdowns, ..
+    } = start(
+        vec![Script {
+            hang: true,
+            ..Script::default()
+        }],
+        HostOptions::default(),
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    drop(host);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while shutdowns.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("drop で process が止められる");
+}
+
+/// 確定の前に発話を積んでから止めたら、その発話は送らない（止めたはずの engine に送らない）。
+#[tokio::test]
+async fn stop_wins_over_prompts_submitted_before_it() {
+    let f = start(
+        vec![Script {
+            turns: [Turn::default()].into(),
+            ..Script::default()
+        }],
+        HostOptions::default(),
+    );
+    f.host.submit("送られないはず", &[]).unwrap();
+    f.host.stop();
+    f.until_shutdown(Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !f.methods().contains(&"session/prompt".to_string()),
+        "{:?}",
+        f.methods()
+    );
+}
+
+/// engine が終了したら、stderr の読み切りを待つ間も `submit` は Err を返す
+/// （Ok を返して黙って捨てない。呼び手は Err を見て host を作り直す）。
+#[tokio::test]
+async fn submit_fails_as_soon_as_the_engine_is_gone() {
+    let turn = Turn {
+        eof: true,
+        ..Turn::default()
+    };
+    let mut f = start_full(
+        vec![Script {
+            turns: [turn].into(),
+            ..Script::default()
+        }],
+        HostOptions::default(),
+        None,
+        Duration::from_millis(800), // stderr の読み切りに時間がかかる
+    );
+    f.until(|e| matches!(e, E::SessionInit { .. })).await;
+    f.host.submit("hi", &[]).unwrap();
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_millis(400), async {
+        while f.host.submit("again", &[]).is_ok() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("読み切りを待たずに Err になる");
+    assert!(f.host.is_finished(), "終了したことも読める");
+    f.until(|e| matches!(e, E::EngineExited { .. })).await;
+    assert!(
+        started.elapsed() >= Duration::from_millis(700),
+        "終了の文は読み切りの後"
+    );
+}
+
+/// 会話を確定できなかった時、待っていた発話があれば、送られなかったことを `Error` で出す。
+#[tokio::test]
+async fn prompts_lost_to_a_failed_establish_are_reported() {
+    let mut f = start(
+        vec![Script {
+            load_error: true,
+            ..Script::default()
+        }],
+        resume("gone"),
+    );
+    f.host.submit("a", &[]).unwrap();
+    f.host.submit("b", &[]).unwrap();
+    let events = f.until(|e| matches!(e, E::EngineExited { .. })).await;
+    let n = events.len();
+    assert!(
+        matches!(&events[n - 2], E::Error { message } if message.contains("session/load") && message.contains("2 件")),
+        "{events:?}"
+    );
+}
+
+/// 確定の後に engine が終了した時も、待たせていた発話があれば知らせる。
+#[tokio::test]
+async fn prompts_lost_to_an_engine_exit_are_reported() {
+    let turn = Turn {
+        updates: vec![agent_text("途中")],
+        eof: true,
+        ..Turn::default()
+    };
+    let mut f = start(
+        vec![Script {
+            turns: [turn].into(),
+            ..Script::default()
+        }],
+        HostOptions::default(),
+    );
+    f.host.submit("first", &[]).unwrap();
+    f.host.submit("待ち", &[]).unwrap();
+    let events = f.until(|e| matches!(e, E::EngineExited { .. })).await;
+    let n = events.len();
+    assert!(
+        matches!(&events[n - 2], E::Error { message } if message.contains("1 件")),
+        "{events:?}"
+    );
+}
+
+/// engine が標準に無い kind の permission を求めてきたら、型で読めない。黙って待たせず、
+/// 未対応として断る（turn は engine の側で続く）。
+#[tokio::test]
+async fn permission_with_unknown_kind_is_refused_not_ignored() {
+    let options = json!([{"optionId": "x", "name": "X", "kind": "allow_for_session"}]);
+    let mut f = start(
+        vec![Script {
+            turns: [Turn {
+                permission: Some(options),
+                ..Turn::default()
+            }]
+            .into(),
+            ..Script::default()
+        }],
+        HostOptions::default(),
+    );
+    f.host.submit("hi", &[]).unwrap();
+    f.until_turn_end().await;
+    let answer = &f.params_of("permission_response")[0];
+    assert!(answer.get("error").is_some(), "{answer}");
+}
+
 /// 中断したら、待たせていた発話も捨てる（止めたのに次の発話が走り出さない）。
 /// 捨てた発話は送られず、控えにも入らない。その後の発話は普通に送れる。
 #[tokio::test]
@@ -1517,6 +1742,39 @@ mod process {
         connector.shutdown();
         drop(new);
         let _ = std::fs::remove_file(&marker);
+    }
+
+    fn alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// 実 process でも、会話の確定を待っている最中の `stop()` と drop は process をすぐ止める。
+    #[tokio::test]
+    async fn stop_and_drop_before_establish_kill_the_real_process() {
+        for by_drop in [false, true] {
+            // ACP を話さない process。確定の上限（30 秒）まで待たされる相手
+            let host =
+                AcpClientHost::spawn(sh("exec sleep 30"), HostOptions::default()).expect("起動");
+            let pid = host.pid().expect("pid");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(alive(pid), "止める前は生きている");
+            if by_drop {
+                drop(host);
+            } else {
+                host.stop();
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while alive(pid) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("process {pid} が残っている（drop={by_drop}）"));
+        }
     }
 }
 

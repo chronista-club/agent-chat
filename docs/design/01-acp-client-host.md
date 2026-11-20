@@ -141,6 +141,7 @@ VP に残すもの:
 - **`restart()` が `Busy` なら**、turn を中断するか終わりを待ってから呼び直す
 - **`restart()` が `Establish` / `Dead` を返したら、host は終了している**（`LoadFallback::Fail` で load に失敗した時、起動できなかった時など）。`EngineExited` も出る。その host はもう使えないので、呼び手が作り直す（`spawn` し直す）。`history()` / `submit()` も同じ Err を返す
 - **chat を開く時は `attach()`**。`history()` と `subscribe()` を別々に呼ばない
+- **`is_finished()` が true の host は使わない**。chat を開く時に見て、終了していたら作り直す
 - **`permission` と `on_session` に重い処理を置かない**（接続全体が止まる）。`on_stderr` も同じく軽くする（こちらは stderr を読む task の中で呼ばれる）
 
 #### load の流れの読み切り
@@ -199,8 +200,13 @@ VP の `AcpAgentHost` に近い形にして、Stage 2 の差し替えを小さ�
 - `spawn_with(connector, cwd, options)`: 接続の作り方（`Connector`）を差し替える口。既定は process の起動。テストは偽の agent をつなぐ。`restart()` はこの口をもう一度呼ぶ
 - permission の既定の方針は `permission::allow`（kind で allow_once → allow_always、無ければ取り消し）
 - `attach()`: 控えへの追加と event の送信を同じ lock の中で行うので、控えに入った event は受け口に出ず、控えに無い event は必ず受け口に出る。`history()` と `subscribe()` を別々に呼ぶと、その間の event が重なるか抜ける
+  - 受け口を差し替える呼び手への注意: 控えに入らない event（`TurnCompleted` / `SessionInit` / `Error` など）は、古い受け口を最後に読んでから `attach()` までの間に出ると、古い受け口にだけ残って落ちる。turn の状態は `attach()` が返す `in_flight` に合わせ、`SessionInit` は `session_init()` で取り直す（VP の acp-stage2 lane が multi-thread の runtime で踏んだ所）
 - 設定の意図: 会話中の `set_config` が成功したら、その値を今の意図として覚える。`restart()` の後の当て直しは今の意図から行う（起動の時の `config_intent` に戻さない）
 - `restart()` が `Busy` を返すのは、turn の最中・送っていない発話がある時・設定の切替の応答を待っている時
+- `stop()` と drop は、会話の確定や設定の当て直しを待っている最中でも、すぐに process を止める。止める合図は命令の queue とは別に持つので、先に `submit` してまだ送っていない発話より先に効く（止めたはずの engine に発話を送ってから止める、が起きない）。止めた時は `EngineExited` を出さない
+- engine の終了や確定の失敗を見た時点で、`submit()` は Err を返し、`is_finished()` は true になる（stderr の読み切りを待つ前に）。呼び手は Err を見て host を作り直せる。`EngineExited` と終了の文（stderr の末尾つき）は、読み切りの後に出る
+- 送られなかった発話は黙って捨てない。確定の失敗や engine の終了で、待っていた発話があれば、`EngineExited` の前に `Error`（理由と件数）を出す。`stop()` と `interrupt()` で捨てた分は出さない（呼び手が自分で止めたため）
+- `is_finished()`: host が終了したかを、待たずに読む。true ならその host はもう使えない。立て直しの途中は false
 - `pid()`: engine の process の pid。`restart()` で process が替わったら新しい pid、engine が終了したら None。process を持たない `Connector` は None（VP は chat engine の pid を lane の実体の印に使う）
 - `HostOptions::on_stderr`: engine の stderr を 1 行ごとに受け取る関数（既定は何もしない）。空行は渡さず、UTF-8 でない byte は置き換える。改行の無い出力は 8 KiB で区切って渡す。終了の文に付ける末尾 4 KB の保持は別に続けている。8 KiB で区切る時は文字の途中で切れて、置き換え文字が 1 つ入ることがある（log 用なので許容）。接続のたびに末尾の buffer を新しくし、前の process の読み手を止めるので、立て直しの後に前の process（やその孫）が遅れて書いた分は、新しい process の末尾にも `on_stderr` にも混ざらない。`spawn_with` で自前の connector を渡す時は、`ProcessConnector::on_stderr` で渡す
 - 確定の前に接続が切れたら `Establish`、確定の後なら `Dead`。engine が initialize を読む前に終了した時、切れ方は OS と時機で変わる（EOF が先か、書き込みの `Broken pipe` が先か）が、どちらでも `Establish` で返す
@@ -310,9 +316,9 @@ prompt の応答は `TurnCompleted` にする（context の使用量を載せる
 
 1. crate `crates/acp`（`agent-chat-acp`）。agent-chat の gate（fmt / clippy `-D warnings` / `test --all-features` / 生成物の drift）に乗っている
 2. calculations: 翻訳・設定・付随情報・permission・履歴の控え。fixture は VP design 88 §1・§6 の実測 wire（agy 1.5.9）と、今回の実測の形（agy 1.5.11）
-3. 偽の agent のテスト（`tests/fake_agent.rs`、36 本）
+3. 偽の agent のテスト（`tests/fake_agent.rs`、45 本）
    - 相手は SDK の `Channel::duplex()` の片側で、生の JSON-RPC を台本どおりに返す。SDK の `Agent.v1()` は使わなかった（load の応答の前後に通知を置く順序を、生の方が直接書ける）
-   - 場面: 新規の turn / load の流れが履歴になる / turn の最中の `history()` と中断 / 発話の写し / `restart()` / load の失敗（既定と新規）/ 待ちの上限 / 設定の当て直しと切替 / 知らない update / EOF / prompt の error / permission の方針 / 発話の順送りと画像 / `SessionInit` の保留 / 会話 ID の callback / 控えの上限 / 会話中に切り替えた設定が立て直しの後も残る / 立て直しの失敗 / 渡した関数の panic / `stop()` / 他の書き手の発話 / `attach()` / process の起動の失敗と stderr の末尾 / 設定の当て直しに答えない engine / pid / stderr の行渡し / 同じ messageId の発話 / 確定の前に接続が切れる場面 / 中断で待ちの発話を捨てる / pending の tool_call と update の 2 段の load
+   - 場面: 新規の turn / load の流れが履歴になる / turn の最中の `history()` と中断 / 発話の写し / `restart()` / load の失敗（既定と新規）/ 待ちの上限 / 設定の当て直しと切替 / 知らない update / EOF / prompt の error / permission の方針 / 発話の順送りと画像 / `SessionInit` の保留 / 会話 ID の callback / 控えの上限 / 会話中に切り替えた設定が立て直しの後も残る / 立て直しの失敗 / 渡した関数の panic / `stop()` / 他の書き手の発話 / `attach()` / process の起動の失敗と stderr の末尾 / 設定の当て直しに答えない engine / pid / stderr の行渡し / 同じ messageId の発話 / 確定の前に接続が切れる場面 / 中断で待ちの発話を捨てる / pending の tool_call と update の 2 段の load / 確定の前と当て直しの最中の stop と drop / 終了の後の submit / 送られなかった発話の通知 / 未知の kind の permission
 4. 実機 E2E（`tests/agy_e2e.rs`、`#[ignore]`、4 本 + 実物の会話を load して数える 1 本）: agy 1.5.11、model は `gemini-3.8-flash`
 5. VP の `AcpAgentHost` との比較（「VP の手書きの host との比較」の節）
 
@@ -340,6 +346,7 @@ agy 1.5.11、2026-11-18、この host 経由。
 | 8c | TUI を開いたままの時、grok / opencode | 測っていない |
 
 permission:
+- 標準に無い kind の option: SDK の `PermissionOptionKind`（schema 1.18.0）は allow_once / allow_always / reject_once / reject_always の 4 つだけで、知らない値を受ける枝が無い。engine が他の kind を出すと、要求は型で読めず、注入した方針には届かない。その要求は session の流れに回り、host が「未対応の要求」として error（method not found）で断る。黙って待たせることは無いが、許可もされない（偽の agent のテストで確認。実機でこの形は見ていない）
 - `--dangerously-skip-permissions` を付けずに file を作らせたが、agy は permission を求めずに実行した（mode は default。この環境の agy の設定によるものかは確かめていない）
 - なので、実機では permission の要求を 1 度も受けていない。要求への答え方は偽の agent のテストだけで確かめている
 
@@ -364,6 +371,7 @@ permission:
 | 過去の会話の履歴 | 出ない（replay_log だけ） | `history()` で U A U A が戻る |
 
 同じだった所:
+- `stop()` で process をその場で止める。この host は最初、止める命令を命令の loop でしか読まず、確定の前（上限 30 秒）と当て直しの最中（上限 15 秒）は process が残った。同じ会話 id で別の process が立つと「2 人の書き手」になる。VP の acp-stage2 lane の自己レビューが見つけた（2026-11-20）
 - 中断で、待たせていた発話も捨てる（VP の codex / vpcode / 手書きの ACP の host は、どれも中断で待ち行列を空にする）。この host は最初、`session/cancel` を送るだけで待ちを残していた。比較のシナリオに「待ちがある状態での中断」が無く、VP の acp-stage2 lane が見つけた（2026-11-20）。lead の判断で VP に合わせた
 - turn の中の並び、tool の名前（`File hello.txt`）と結果の形、中断の速さ
 - 最初の turn の途中で `available_commands_update` が来て、`SessionInit` が turn の終わり（`TurnCompleted` の直前）に出し直される所
