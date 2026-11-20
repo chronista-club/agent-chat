@@ -41,6 +41,8 @@ use crate::translate::AcpTranslator;
 
 /// stderr の 1 行として溜める上限。超えたら改行を待たずに渡す。
 const STDERR_LINE_BYTES: usize = 8192;
+/// engine の終了の後、stderr の読み切りを待つ上限。孫 process が stderr を握ったままでも待ち続けない。
+const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// 保持する stderr の末尾の大きさ。
 const STDERR_TAIL_BYTES: usize = 4096;
 const EVENT_CAPACITY: usize = 1024;
@@ -163,6 +165,11 @@ pub trait Connector: Send + 'static {
     fn pid(&self) -> Option<u32> {
         None
     }
+    /// stderr を読み切るまで待つ future を返す。[`Self::stderr_tail`] の前に host が（上限つきで）待つ。
+    /// engine が終了した直後は、最後に書いた分をまだ読んでいないことがある。
+    fn stderr_drained(&mut self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(std::future::ready(()))
+    }
 }
 
 /// process を起動して stdio をつなぐ。
@@ -172,6 +179,8 @@ pub struct ProcessConnector {
     /// 起動した時の pid（`Child::id` は終了を回収した後 None になるので、起動の時に控える）。
     pid: Option<u32>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    /// stderr を読む task。EOF まで読んだら終わる。
+    stderr_reader: Option<tokio::task::JoinHandle<()>>,
     on_stderr: StderrCallback,
 }
 
@@ -182,6 +191,7 @@ impl ProcessConnector {
             child: None,
             pid: None,
             stderr: Arc::default(),
+            stderr_reader: None,
             on_stderr: Arc::new(|_| {}),
         }
     }
@@ -228,7 +238,7 @@ impl Connector for ProcessConnector {
             let tail = Arc::clone(&self.stderr);
             tail.lock().expect("stderr lock").clear();
             let on_stderr = Arc::clone(&self.on_stderr);
-            tokio::spawn(async move {
+            self.stderr_reader = Some(tokio::spawn(async move {
                 let mut buf = [0u8; 1024];
                 // 改行が来るまでの読みかけの 1 行。
                 let mut line = Vec::new();
@@ -256,7 +266,7 @@ impl Connector for ProcessConnector {
                 }
                 // 改行で終わらなかった最後の行。
                 emit_stderr_line(&on_stderr, &line);
-            });
+            }));
         }
         self.pid = child.id();
         self.child = Some(child);
@@ -284,6 +294,15 @@ impl Connector for ProcessConnector {
 
     fn pid(&self) -> Option<u32> {
         self.pid
+    }
+
+    fn stderr_drained(&mut self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+        let reader = self.stderr_reader.take();
+        Box::pin(async move {
+            if let Some(reader) = reader {
+                let _ = reader.await;
+            }
+        })
     }
 }
 
@@ -616,6 +635,10 @@ async fn supervise<C: Connector>(
         };
         connector.shutdown();
         ctx.shared().pid = None;
+        if !matches!(exit, Exit::Restart(_) | Exit::Stop) {
+            // 終了の文に stderr の末尾を付ける。最後に書かれた分を読み切ってから取る。
+            let _ = tokio::time::timeout(STDERR_DRAIN_TIMEOUT, connector.stderr_drained()).await;
+        }
         let error = match exit {
             Exit::Restart(reply) => {
                 // 先に Starting にする。控えを空にした後で Ready のまま読まれないように。
