@@ -144,6 +144,7 @@ VP に残すもの:
 - **chat を開く時は `attach()`**。`history()` と `subscribe()` を別々に呼ばない
 - **`is_finished()` が true の host は使わない**。chat を開く時に見て、終了していたら作り直す
   - `is_finished()` が true になってから `Error` / `EngineExited` が出るまで、最大 1 秒ある（stderr の読み切り）。その間に host を捨てて作り直すと、古い host の受け口を読むのをやめた時点で、「待っていた発話 N 件は送られていません」などの文は届かない。文を画面に出したい呼び手は、`EngineExited` を読んでから捨てる
+- **`TurnCompleted` を受けても、host が終了していることがある**（中断に答えない engine を待ち切りで止めた時）。turn の終わりを見て次の発話を送る呼び手は、`submit()` の Err か `is_finished()` を見て作り直す。続けて `EngineExited` が出る
 - **log の target は `agent_chat_acp`**。host の警告（load に失敗して新規に替えた、未対応の要求を断った、など）は `tracing` でこの target に出る。consumer の log の filter にこの target が無いと、警告が log から消える（VP は filter に足した）
 - **`permission` と `on_session` に重い処理を置かない**（接続全体が止まる）。`on_stderr` も同じく軽くする（こちらは stderr を読む task の中で呼ばれる）
 
@@ -204,6 +205,11 @@ VP の `AcpAgentHost` に近い形にして、Stage 2 の差し替えを小さ�
   - `restart()` の命令より後に `submit` された発話は、命令の列に残り、立て直した接続で送られる。その間も待ちに入っているので、`restart()` が返す控えの末尾に出る（意図した動き。テストは無い）
 - **会話の確定の前の `interrupt()` は、「送ってから止める」になる**（VP の手書きの host との違い）。`interrupt()` は命令の列に並ぶので、確定の前に「`submit(A)` → `interrupt()`」と呼ぶと、確定の後に「A を受け取る → turn の最中でないのですぐ A を送る → 中断（A の turn を `session/cancel`）」の順で処理される。A は engine に届き、控えにも入る。VP の手書きの host は、確定の前でも待ちをその場で捨てていたので、A は送られなかった。起きるのは「chat を開いて 2 秒ほどの間に送って、すぐ止めた」時だけなので、今は直していない（code を読んで確かめた。この順を見るテストは無い）。`stop()` は別で、確定の前でも先に効く
 - `interrupt()` は、今の turn を中断し（`session/cancel`）、待たせていた発話も捨てる。turn の最中でなくても待ちは捨てる。捨てた発話は送られず、控えにも入らない（控えには送信の時に入れるため）。捨てた件数は返さない
+- **中断に答えない engine は止める**。engine が `HostOptions::cancel_grace`（既定 3 秒）の間に中断した turn を閉じなければ、engine が固まったとみなし、host は process を止めて終了し（呼び手が作り直す）、`TurnCompleted`（turn を閉じる）→ `EngineExited` を出す。`TurnCompleted` が出るのは中断から 3〜4 秒後（期限 3 秒の後、stderr の読み切りを最大 1 秒待ってから出す）。期限の数え始めは最初の中断で、中断を重ねても延ばさない。期限は turn の終わりで下ろし、次の turn へ持ち越さない。期限の待ちの間に受け取った発話は送らず、`TurnCompleted` の後、`EngineExited` の前に `Error` で件数を知らせる
+  - 理由: agy が thinking のまま 3000 秒以上固まり、停止を押しても `session/cancel` に答えず、turn が閉じなかった。呼び手（VP の GUI）は turn の終わりを見るまで「応答中」のままで、次の発話も送れなかった（2026-11-24、mako の報告）。実測の応答は 2〜14 ms（実測 5）なので、答える engine を 3 秒で止めることは無い見込み。ただし grok / opencode の中断の速さと、長い tool の実行中の中断の速さは測っていない
+  - `TurnCompleted` は host が終了した後（`submit` が Err を返す状態）に出す。それを見て呼び手が次の発話を送っても、固まった engine に積まれて黙って失われることが無く、Err を見て host を作り直せる。この順は同じ task の中の並びで守っている（テストは current_thread の runtime なので、await を挟まない並びの崩れは赤にできない）
+  - 期限の前に engine が終了した・接続が切れた時は、今までどおり `EngineExited` だけで、`TurnCompleted` は出ない。turn の終わりとして扱うのは呼び手（VP は `EngineExited` も turn の終わりとして扱う）
+  - 止めるのは engine の process だけ。engine が起こした tool の子 process（process group）は止めない（`stop()` と同じ、今までからの課題）
 - 失敗は `HostError`（`Spawn` / `Establish` / `Dead` / `Busy` / `Engine`）
 - `spawn_with(connector, cwd, options)`: 接続の作り方（`Connector`）を差し替える口。既定は process の起動。テストは偽の agent をつなぐ。`restart()` はこの口をもう一度呼ぶ
 - permission の既定の方針は `permission::allow`（kind で allow_once → allow_always、無ければ取り消し）
@@ -240,6 +246,8 @@ pub struct HostOptions {
     pub establish_timeout: Duration,
     /// 設定の応答を待つ上限（既定 15 秒）。当て直しは全体で、会話中の切替は 1 回ごと
     pub config_timeout: Duration,
+    /// 中断の後、engine が turn を閉じるのを待つ上限（既定 3 秒）。超えたら process を止め、TurnCompleted → EngineExited を出す
+    pub cancel_grace: Duration,
     /// spawn 後に当て直す (config id, 値)。agy は load の後に既定へ戻る（VP design 88 §6.1）
     pub config_intent: Vec<(String, String)>,
     pub permission: Arc<dyn Fn(&RequestPermissionRequest) -> PermissionDecision + Send + Sync>,
@@ -325,9 +333,9 @@ prompt の応答は `TurnCompleted` にする（context の使用量を載せる
 
 1. crate `crates/acp`（`agent-chat-acp`）。agent-chat の gate（fmt / clippy `-D warnings` / `test --all-features` / 生成物の drift）に乗っている
 2. calculations: 翻訳・設定・付随情報・permission・履歴の控え。fixture は VP design 88 §1・§6 の実測 wire（agy 1.5.9）と、今回の実測の形（agy 1.5.11）
-3. 偽の agent のテスト（`tests/fake_agent.rs`、51 本）
+3. 偽の agent のテスト（`tests/fake_agent.rs`、55 本）
    - 相手は SDK の `Channel::duplex()` の片側で、生の JSON-RPC を台本どおりに返す。SDK の `Agent.v1()` は使わなかった（load の応答の前後に通知を置く順序を、生の方が直接書ける）
-   - 場面: 新規の turn / load の流れが履歴になる / turn の最中の `history()` と中断 / 発話の写し / `restart()` / load の失敗（既定と新規）/ 待ちの上限 / 設定の当て直しと切替 / 知らない update / EOF / prompt の error / permission の方針 / 発話の順送りと画像 / `SessionInit` の保留 / 会話 ID の callback / 控えの上限 / 会話中に切り替えた設定が立て直しの後も残る / 立て直しの失敗 / 渡した関数の panic / `stop()` / 他の書き手の発話 / `attach()` / process の起動の失敗と stderr の末尾 / 設定の当て直しに答えない engine / pid / stderr の行渡し / 同じ messageId の発話 / 確定の前に接続が切れる場面 / 中断で待ちの発話を捨てる / pending の tool_call と update の 2 段の load / 確定の前と当て直しの最中の stop と drop / 終了の後の submit / 送られなかった発話の通知 / 未知の kind の permission / まだ送っていない発話が控えに入る
+   - 場面: 新規の turn / load の流れが履歴になる / turn の最中の `history()` と中断 / 発話の写し / `restart()` / load の失敗（既定と新規）/ 待ちの上限 / 設定の当て直しと切替 / 知らない update / EOF / prompt の error / permission の方針 / 発話の順送りと画像 / `SessionInit` の保留 / 会話 ID の callback / 控えの上限 / 会話中に切り替えた設定が立て直しの後も残る / 立て直しの失敗 / 渡した関数の panic / `stop()` / 他の書き手の発話 / `attach()` / process の起動の失敗と stderr の末尾 / 設定の当て直しに答えない engine / pid / stderr の行渡し / 同じ messageId の発話 / 確定の前に接続が切れる場面 / 中断で待ちの発話を捨てる / pending の tool_call と update の 2 段の load / 確定の前と当て直しの最中の stop と drop / 終了の後の submit / 送られなかった発話の通知 / 未知の kind の permission / まだ送っていない発話が控えに入る / 中断に答えない engine（待ち切りで閉じる・中断を重ねても延ばさない・次の turn へ持ち越さない・待ちの間の発話を知らせる）
 4. 実機 E2E（`tests/agy_e2e.rs`、`#[ignore]`、4 本 + 実物の会話を load して数える 1 本）: agy 1.5.11、model は `gemini-3.8-flash`
 5. VP の `AcpAgentHost` との比較（「VP の手書きの host との比較」の節）
 

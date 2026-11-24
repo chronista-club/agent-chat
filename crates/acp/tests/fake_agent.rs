@@ -35,6 +35,8 @@ struct Turn {
     error: bool,
     /// updates を送った後、応答せずに接続を閉じる。
     eof: bool,
+    /// updates を送った後、応答しない。`session/cancel` にも答えない（固まった engine）。
+    hang: bool,
 }
 
 /// 接続 1 本ぶんの台本。
@@ -146,6 +148,9 @@ async fn fake_agent(mut peer: Channel, mut script: Script, log: Log) {
                         }
                         if turn.eof {
                             return;
+                        }
+                        if turn.hang {
+                            continue;
                         }
                         if let Some(options) = turn.permission {
                             send(
@@ -1728,6 +1733,183 @@ async fn interrupt_drops_queued_prompts() {
         [user("first"), msg("1"), user("after"), msg("次")],
         "捨てた発話は控えに入らない"
     );
+}
+
+/// 中断（`session/cancel`）に engine が答えない時（agy が thinking のまま 3000 秒固まった、
+/// 2026-11-24 mako の報告）は、待ち切り（既定 3 秒）で engine を止め、`TurnCompleted` で turn を閉じる。
+/// 止めたのに「応答中」のまま残り、次の発話も送れなくなる、を起こさない。
+/// 閉じる順は `TurnCompleted` → `EngineExited`。`TurnCompleted` は host が終了した後に出す。
+/// ⚠️ current_thread の runtime なので、`TurnCompleted` を host の終了より前（await を挟まない所）へ
+/// 動かしても、ここの「その時点で終了している」は赤にならない（並びはコードで守っている）。
+#[tokio::test(start_paused = true)]
+async fn unanswered_interrupt_closes_the_turn_and_stops_the_engine() {
+    let turn = Turn {
+        updates: vec![agent_text("考え中")],
+        hang: true,
+        ..Turn::default()
+    };
+    let mut f = start(
+        vec![Script {
+            turns: [turn].into(),
+            ..Script::default()
+        }],
+        HostOptions::default(),
+    );
+    f.host.submit("長い仕事", &[]).unwrap();
+    f.until(|e| matches!(e, E::MessageChunk { .. })).await;
+    let interrupted = tokio::time::Instant::now();
+    f.host.interrupt().unwrap();
+    // 最初に来る終わりの印が TurnCompleted（`EngineExited` の前に turn を閉じる）。
+    let events = f
+        .until(|e| matches!(e, E::TurnCompleted { .. } | E::EngineExited { .. }))
+        .await;
+
+    let waited = interrupted.elapsed();
+    assert!(
+        waited >= Duration::from_secs(3) && waited < Duration::from_secs(4),
+        "既定の待ち切りは 3 秒: {waited:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(E::TurnCompleted { session_id, .. }) if session_id == "new-1"),
+        "`EngineExited` の前に turn を閉じる: {events:?}"
+    );
+    // TurnCompleted を受けた時点で host はもう終了している。それを見て送った次の発話は Err になり、
+    // 固まった engine に積まれて黙って失われない（呼び手は Err を見て作り直す）。
+    assert!(
+        f.host.is_finished(),
+        "TurnCompleted の時点で host は終了している"
+    );
+    assert!(
+        f.host.submit("次", &[]).is_err(),
+        "turn の終わりを見て送った発話は Err"
+    );
+    let rest = f.until(|e| matches!(e, E::EngineExited { .. })).await;
+    assert!(
+        matches!(rest.as_slice(), [E::EngineExited { message }] if message.contains("session/cancel")),
+        "待ちの発話が無ければ、続くのは理由つきの終了 1 件だけ: {rest:?}"
+    );
+    assert_eq!(f.params_of("session/cancel").len(), 1);
+    assert_eq!(f.shutdowns.load(Ordering::SeqCst), 1, "process を止める");
+    assert!(
+        matches!(f.host.history().await, Err(HostError::Dead(_))),
+        "終了した host の控えは Dead"
+    );
+}
+
+/// 期限の待ちの間に受け取った発話（中断の後に送られた分）は送られずに終わる。黙って捨てずに、
+/// turn を閉じた後、`EngineExited` の前に `Error` で件数を知らせる。
+#[tokio::test(start_paused = true)]
+async fn prompts_submitted_while_waiting_for_the_cancel_are_reported() {
+    let turn = Turn {
+        updates: vec![agent_text("考え中")],
+        hang: true,
+        ..Turn::default()
+    };
+    let mut f = start(
+        vec![Script {
+            turns: [turn].into(),
+            ..Script::default()
+        }],
+        HostOptions::default(),
+    );
+    f.host.submit("長い仕事", &[]).unwrap();
+    f.until(|e| matches!(e, E::MessageChunk { .. })).await;
+    f.host.interrupt().unwrap();
+    f.host.submit("中断の後の発話", &[]).unwrap();
+    let events = f.until(|e| matches!(e, E::EngineExited { .. })).await;
+
+    let n = events.len();
+    assert!(n >= 3, "{events:?}");
+    assert!(
+        matches!(
+            &events[n - 3..],
+            [
+                E::TurnCompleted { .. },
+                E::Error { message },
+                E::EngineExited { .. },
+            ] if message.contains("1 件")
+        ),
+        "turn を閉じる → 送られなかった件数 → 終了: {events:?}"
+    );
+    assert_eq!(
+        f.params_of("session/prompt").len(),
+        1,
+        "中断の後の発話は送らない"
+    );
+}
+
+/// 待ち切りは呼び手が決められる。数え始めは最初の中断で、中断を重ねても延ばさない
+/// （「止まらないので停止を連打する」で、いつまでも止まらない、を起こさない）。
+#[tokio::test(start_paused = true)]
+async fn pressing_interrupt_again_does_not_extend_the_deadline() {
+    let turn = Turn {
+        updates: vec![agent_text("考え中")],
+        hang: true,
+        ..Turn::default()
+    };
+    let mut f = start(
+        vec![Script {
+            turns: [turn].into(),
+            ..Script::default()
+        }],
+        HostOptions {
+            cancel_grace: Duration::from_secs(1),
+            ..HostOptions::default()
+        },
+    );
+    f.host.submit("長い仕事", &[]).unwrap();
+    f.until(|e| matches!(e, E::MessageChunk { .. })).await;
+    let interrupted = tokio::time::Instant::now();
+    f.host.interrupt().unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    f.host.interrupt().unwrap();
+    f.until(|e| matches!(e, E::EngineExited { .. })).await;
+
+    let waited = interrupted.elapsed();
+    assert!(
+        waited >= Duration::from_secs(1) && waited < Duration::from_millis(1600),
+        "最初の中断から 1 秒で止める: {waited:?}"
+    );
+}
+
+/// 中断に答えた turn の後は、待ち切りを次の turn へ持ち越さない（待ち切りより長い turn を止めない）。
+#[tokio::test(start_paused = true)]
+async fn answered_interrupt_does_not_carry_the_deadline_into_the_next_turn() {
+    let turns = [
+        Turn {
+            updates: vec![agent_text("1")],
+            wait_cancel: true,
+            ..Turn::default()
+        },
+        Turn {
+            updates: vec![agent_text("2")],
+            delay: Duration::from_secs(4),
+            ..Turn::default()
+        },
+    ];
+    let mut f = start(
+        vec![Script {
+            turns: turns.into(),
+            ..Script::default()
+        }],
+        HostOptions::default(),
+    );
+    f.host.submit("first", &[]).unwrap();
+    f.until(|e| matches!(e, E::MessageChunk { .. })).await;
+    f.host.interrupt().unwrap();
+    f.until_turn_end().await;
+
+    f.host.submit("second", &[]).unwrap();
+    let started = tokio::time::Instant::now();
+    let events = f.until_turn_end().await;
+    assert!(events.contains(&msg("2")), "{events:?}");
+    // 持ち越した期限（3 秒）で切られていたら、turn の終わりは 3 秒で来る。
+    assert!(
+        started.elapsed() >= Duration::from_secs(4),
+        "turn の終わりは engine が 4 秒後に出したもの: {:?}",
+        started.elapsed()
+    );
+    assert!(!f.host.is_finished());
 }
 
 /// opencode は load で、tool を `tool_call`（pending）と `tool_call_update` の 2 段で流す
