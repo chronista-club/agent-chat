@@ -88,6 +88,11 @@ pub struct HostOptions {
     /// 設定の応答を待つ上限。当て直しは全体でこの時間まで、会話中の切替は 1 回ごと。
     /// 超えても host は止めず、設定面に失敗の文を残す。agy の実測の応答は 0.1 秒ほど。
     pub config_timeout: Duration,
+    /// 中断（`session/cancel`）の後、engine が turn を閉じるのを待つ上限。超えたら engine が
+    /// 固まったとみなし、turn を `TurnCompleted` で閉じてから process を止める（`EngineExited`、
+    /// host は終了）。数え始めは最初の中断で、中断を重ねても延ばさない。
+    /// agy の実測の応答は 2〜14 ms（設計書 01 の実測 5）。
+    pub cancel_grace: Duration,
     /// 会話の確定の後に当て直す `(config id, 値)`。agy は load の後に既定へ戻る。
     pub config_intent: Vec<(String, String)>,
     /// permission の要求への答え方。重い処理をしない（接続全体が止まる）。
@@ -108,6 +113,7 @@ impl Default for HostOptions {
             on_load_failed: LoadFallback::default(),
             establish_timeout: Duration::from_secs(30),
             config_timeout: Duration::from_secs(15),
+            cancel_grace: Duration::from_secs(3),
             config_intent: Vec::new(),
             permission: Arc::new(permission::allow),
             on_session: Arc::new(|_| Ok(())),
@@ -447,6 +453,8 @@ enum Exit {
     Establish(String),
     /// 確定の後に engine が終了した / 接続が切れた。
     Dead(String),
+    /// 中断に engine が待ち切りまで答えなかった。turn を閉じてから、`Dead` と同じく終了を知らせる。
+    Abandoned(String),
 }
 
 /// ACP engine の host。
@@ -529,6 +537,10 @@ impl AcpClientHost {
 
     /// 今の turn を中断し（`session/cancel`）、待たせていた発話を捨てる。
     /// turn の最中でなくても、待ちは捨てる。
+    ///
+    /// 中断した turn は必ず `TurnCompleted` で閉じる。engine が [`HostOptions::cancel_grace`] の間に
+    /// turn を閉じなければ、host が `TurnCompleted` を出して turn を閉じ、process を止めて
+    /// `EngineExited` を出す（host は終了する。呼び手が作り直す）。
     pub fn interrupt(&self) -> Result<(), HostError> {
         self.send(Command::Interrupt)
     }
@@ -693,6 +705,7 @@ async fn supervise<C: Connector>(
         };
         connector.shutdown();
         ctx.shared().pid = None;
+        let abandoned = matches!(exit, Exit::Abandoned(_));
         let (early, reason, lost) = match exit {
             Exit::Restart(reply) if !*ctx.stop.borrow() => {
                 // 先に Starting にする。控えを空にした後で Ready のまま読まれないように。
@@ -721,6 +734,11 @@ async fn supervise<C: Connector>(
             Exit::Dead(message) => (
                 HostError::Dead(message),
                 Some("engine が終了しました".to_string()),
+                ctx.shared().pending.len(),
+            ),
+            Exit::Abandoned(message) => (
+                HostError::Dead(message),
+                Some("engine が中断に答えないため止めました".to_string()),
                 ctx.shared().pending.len(),
             ),
         };
@@ -752,6 +770,23 @@ async fn supervise<C: Connector>(
             HostError::Dead(message) => HostError::Dead(with_stderr(message, &stderr)),
             other => other,
         };
+        // 中断に答えなかった engine の turn は、host が閉じる（中断した turn は必ず
+        // `TurnCompleted` で閉じる）。ここで出すのは、host が終了した後（`submit` が Err を返す
+        // 状態）にするため: 受け手が turn の終わりを見て次の発話を送っても、固まった engine に
+        // 積まれて黙って失われることが無く、Err を見て host を作り直せる。
+        if abandoned {
+            let shared = ctx.shared();
+            let (session_id, usage) = (shared.session_id.clone(), shared.usage);
+            drop(shared);
+            if let Some(session_id) = session_id {
+                ctx.emit(ConversationEvent::TurnCompleted {
+                    session_id,
+                    cost_usd: None,
+                    context_tokens: usage.map(|(used, _)| used),
+                    context_window: usage.map(|(_, size)| size),
+                });
+            }
+        }
         // 送られなかった発話は、黙って捨てずに会話に出す。確定の失敗は、待ちが無くても
         // 理由を出す（`EngineExited` の文を画面に出さない UI でも、理由が見えるように）。
         if lost > 0 {
@@ -859,6 +894,9 @@ struct Connection {
     in_turn: bool,
     /// turn の最中に slash command が変わった。turn の終わりに `SessionInit` を出し直す。
     init_deferred: bool,
+    /// 中断した turn を engine が閉じるのを待つ期限（[`HostOptions::cancel_grace`]）。
+    /// 最初の中断で立て、turn の終わりで下ろす。
+    cancel_deadline: Option<tokio::time::Instant>,
 }
 
 /// 設定の切替の応答（接続の task から命令のループへ戻す）。
@@ -932,6 +970,7 @@ async fn establish(
         queue: VecDeque::new(),
         in_turn: false,
         init_deferred: false,
+        cancel_deadline: None,
     };
     {
         let (model, mode) = extract_session_meta(&meta);
@@ -1015,15 +1054,26 @@ impl Connection {
         // 応答を待っている設定の切替の数。待ちがある間は立て直さない（結果が分からなくなる）。
         let mut config_pending = 0usize;
         loop {
+            let cancel_deadline = self.cancel_deadline;
             tokio::select! {
                 // 止める合図が先。先に積まれた発話があっても、送らずに止める。
                 // 次に engine からの流れを読み切る（EOF より前に届いた分を落とさない）。
+                // 中断の期限はその後: 期限の間際に届いた turn の終わりを先に読む。
                 biased;
                 () = ctx.stopped() => return Exit::Stop,
                 message = self.session.read_update() => match message {
                     Ok(message) => self.on_message(ctx, message, false),
                     Err(e) => return Exit::Dead(e.to_string()),
                 },
+                () = tokio::time::sleep_until(
+                    cancel_deadline.unwrap_or_else(tokio::time::Instant::now),
+                ), if cancel_deadline.is_some() => {
+                    let grace = ctx.options.cancel_grace;
+                    tracing::warn!(?grace, "engine が中断（session/cancel）に答えない。process を止める");
+                    return Exit::Abandoned(format!(
+                        "中断（session/cancel）に {grace:?} 答えがありませんでした"
+                    ));
+                }
                 Some(done) = config_rx.recv() => {
                     config_pending = config_pending.saturating_sub(1);
                     let mut shared = ctx.shared();
@@ -1066,12 +1116,17 @@ impl Connection {
                         let dropped = dropped.min(shared.pending.len());
                         shared.pending.drain(..dropped);
                         drop(shared);
-                        if self.in_turn
-                            && let Err(e) = cx.send_notification(CancelNotification::new(
+                        if self.in_turn {
+                            if let Err(e) = cx.send_notification(CancelNotification::new(
                                 self.session_id.clone(),
-                            ))
-                        {
-                            return Exit::Dead(e.to_string());
+                            )) {
+                                return Exit::Dead(e.to_string());
+                            }
+                            // engine が turn を閉じるのを待つのは期限まで（固まった engine で
+                            // 「応答中」のまま残さない）。中断を重ねても延ばさない。
+                            self.cancel_deadline.get_or_insert_with(|| {
+                                tokio::time::Instant::now() + ctx.options.cancel_grace
+                            });
                         }
                     }
                     Some(Command::SetConfig { id, value, reply }) => {
@@ -1252,6 +1307,8 @@ impl Connection {
             });
         }
         self.in_turn = false;
+        // 中断の期限を次の turn へ持ち越さない。
+        self.cancel_deadline = None;
         // 保留した SessionInit は TurnCompleted の前に出す（VP の手書きの host と同じ並び）。
         if std::mem::take(&mut self.init_deferred)
             && let Some(init) = ctx.build_session_init()
