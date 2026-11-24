@@ -1736,7 +1736,7 @@ async fn interrupt_drops_queued_prompts() {
 }
 
 /// 中断（`session/cancel`）に engine が答えない時（agy が thinking のまま 3000 秒固まった、
-/// 2026-11-24 mako の報告）は、待ち切り（既定 3 秒）で turn を閉じ、engine を止める。
+/// 2026-11-24 mako の報告）は、待ち切り（既定 3 秒）で engine を止め、`TurnCompleted` で turn を閉じる。
 /// 止めたのに「応答中」のまま残り、次の発話も送れなくなる、を起こさない。
 /// 閉じる順は `TurnCompleted` → `EngineExited`。`TurnCompleted` は host が終了した後に出す。
 /// ⚠️ current_thread の runtime なので、`TurnCompleted` を host の終了より前（await を挟まない所）へ
@@ -1759,7 +1759,7 @@ async fn unanswered_interrupt_closes_the_turn_and_stops_the_engine() {
     f.until(|e| matches!(e, E::MessageChunk { .. })).await;
     let interrupted = tokio::time::Instant::now();
     f.host.interrupt().unwrap();
-    // 最初に来る終わりの印が TurnCompleted（engine の終了の前に turn を閉じる）。
+    // 最初に来る終わりの印が TurnCompleted（`EngineExited` の前に turn を閉じる）。
     let events = f
         .until(|e| matches!(e, E::TurnCompleted { .. } | E::EngineExited { .. }))
         .await;
@@ -1771,7 +1771,7 @@ async fn unanswered_interrupt_closes_the_turn_and_stops_the_engine() {
     );
     assert!(
         matches!(events.last(), Some(E::TurnCompleted { session_id, .. }) if session_id == "new-1"),
-        "engine の終了の前に turn を閉じる: {events:?}"
+        "`EngineExited` の前に turn を閉じる: {events:?}"
     );
     // TurnCompleted を受けた時点で host はもう終了している。それを見て送った次の発話は Err になり、
     // 固まった engine に積まれて黙って失われない（呼び手は Err を見て作り直す）。
@@ -1797,7 +1797,7 @@ async fn unanswered_interrupt_closes_the_turn_and_stops_the_engine() {
 }
 
 /// 期限の待ちの間に受け取った発話（中断の後に送られた分）は送られずに終わる。黙って捨てずに、
-/// turn を閉じた後、engine の終了の前に `Error` で件数を知らせる。
+/// turn を閉じた後、`EngineExited` の前に `Error` で件数を知らせる。
 #[tokio::test(start_paused = true)]
 async fn prompts_submitted_while_waiting_for_the_cancel_are_reported() {
     let turn = Turn {

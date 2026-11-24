@@ -207,7 +207,7 @@ VP の `AcpAgentHost` に近い形にして、Stage 2 の差し替えを小さ�
 - `interrupt()` は、今の turn を中断し（`session/cancel`）、待たせていた発話も捨てる。turn の最中でなくても待ちは捨てる。捨てた発話は送られず、控えにも入らない（控えには送信の時に入れるため）。捨てた件数は返さない
 - **中断に答えない engine は止める**。engine が `HostOptions::cancel_grace`（既定 3 秒）の間に中断した turn を閉じなければ、engine が固まったとみなし、host は process を止めて終了し（呼び手が作り直す）、`TurnCompleted`（turn を閉じる）→ `EngineExited` を出す。`TurnCompleted` が出るのは中断から 3〜4 秒後（期限 3 秒の後、stderr の読み切りを最大 1 秒待ってから出す）。期限の数え始めは最初の中断で、中断を重ねても延ばさない。期限は turn の終わりで下ろし、次の turn へ持ち越さない。期限の待ちの間に受け取った発話は送らず、`TurnCompleted` の後、`EngineExited` の前に `Error` で件数を知らせる
   - 理由: agy が thinking のまま 3000 秒以上固まり、停止を押しても `session/cancel` に答えず、turn が閉じなかった。呼び手（VP の GUI）は turn の終わりを見るまで「応答中」のままで、次の発話も送れなかった（2026-11-24、mako の報告）。実測の応答は 2〜14 ms（実測 5）なので、答える engine を 3 秒で止めることは無い見込み。ただし grok / opencode の中断の速さと、長い tool の実行中の中断の速さは測っていない
-  - `TurnCompleted` は host が終了した後（`submit` が Err を返す状態）に出す。それを見て呼び手が次の発話を送っても、固まった engine に積まれて黙って失われることが無く、Err を見て host を作り直せる。この順は同じ task の中の並びで守っている（テストは current_thread の runtime なので、並びの崩れを赤にできない）
+  - `TurnCompleted` は host が終了した後（`submit` が Err を返す状態）に出す。それを見て呼び手が次の発話を送っても、固まった engine に積まれて黙って失われることが無く、Err を見て host を作り直せる。この順は同じ task の中の並びで守っている（テストは current_thread の runtime なので、await を挟まない並びの崩れは赤にできない）
   - 期限の前に engine が終了した・接続が切れた時は、今までどおり `EngineExited` だけで、`TurnCompleted` は出ない。turn の終わりとして扱うのは呼び手（VP は `EngineExited` も turn の終わりとして扱う）
   - 止めるのは engine の process だけ。engine が起こした tool の子 process（process group）は止めない（`stop()` と同じ、今までからの課題）
 - 失敗は `HostError`（`Spawn` / `Establish` / `Dead` / `Busy` / `Engine`）
