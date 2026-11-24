@@ -538,9 +538,10 @@ impl AcpClientHost {
     /// 今の turn を中断し（`session/cancel`）、待たせていた発話を捨てる。
     /// turn の最中でなくても、待ちは捨てる。
     ///
-    /// 中断した turn は必ず `TurnCompleted` で閉じる。engine が [`HostOptions::cancel_grace`] の間に
-    /// turn を閉じなければ、host が `TurnCompleted` を出して turn を閉じ、process を止めて
-    /// `EngineExited` を出す（host は終了する。呼び手が作り直す）。
+    /// engine が [`HostOptions::cancel_grace`] の間に中断した turn を閉じなければ、host が
+    /// `TurnCompleted` を出して turn を閉じ、process を止めて `EngineExited` を出す（host は終了する。
+    /// 呼び手が作り直す）。期限の前に engine が終了した・接続が切れた時は、今までどおり
+    /// `EngineExited` だけで、`TurnCompleted` は出ない（turn の終わりとして扱うのは呼び手）。
     pub fn interrupt(&self) -> Result<(), HostError> {
         self.send(Command::Interrupt)
     }
@@ -770,10 +771,12 @@ async fn supervise<C: Connector>(
             HostError::Dead(message) => HostError::Dead(with_stderr(message, &stderr)),
             other => other,
         };
-        // 中断に答えなかった engine の turn は、host が閉じる（中断した turn は必ず
-        // `TurnCompleted` で閉じる）。ここで出すのは、host が終了した後（`submit` が Err を返す
-        // 状態）にするため: 受け手が turn の終わりを見て次の発話を送っても、固まった engine に
-        // 積まれて黙って失われることが無く、Err を見て host を作り直せる。
+        // 中断に答えなかった engine の turn は、host が `TurnCompleted` で閉じる。ここで出すのは、
+        // host が終了した後（`submit` が Err を返す状態）にするため: 受け手が turn の終わりを見て
+        // 次の発話を送っても、固まった engine に積まれて黙って失われることが無く、Err を見て
+        // host を作り直せる。⚠️ この順は同じ task の中の並びで守っている（`Phase::Failed` と
+        // `commands.close()` が先）。テストは current_thread の runtime で、await を挟まない並びの
+        // 崩れは観測できないので、ここを動かす時は並びを保つ。
         if abandoned {
             let shared = ctx.shared();
             let (session_id, usage) = (shared.session_id.clone(), shared.usage);
