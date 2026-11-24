@@ -89,8 +89,8 @@ pub struct HostOptions {
     /// 超えても host は止めず、設定面に失敗の文を残す。agy の実測の応答は 0.1 秒ほど。
     pub config_timeout: Duration,
     /// 中断（`session/cancel`）の後、engine が turn を閉じるのを待つ上限。超えたら engine が
-    /// 固まったとみなし、turn を `TurnCompleted` で閉じてから process を止める（`EngineExited`、
-    /// host は終了）。数え始めは最初の中断で、中断を重ねても延ばさない。
+    /// 固まったとみなし、process を止めて host を終了してから、`TurnCompleted`（turn を閉じる）→
+    /// `EngineExited` を出す。数え始めは最初の中断で、中断を重ねても延ばさない。
     /// agy の実測の応答は 2〜14 ms（設計書 01 の実測 5）。
     pub cancel_grace: Duration,
     /// 会話の確定の後に当て直す `(config id, 値)`。agy は load の後に既定へ戻る。
@@ -538,9 +538,10 @@ impl AcpClientHost {
     /// 今の turn を中断し（`session/cancel`）、待たせていた発話を捨てる。
     /// turn の最中でなくても、待ちは捨てる。
     ///
-    /// engine が [`HostOptions::cancel_grace`] の間に中断した turn を閉じなければ、host が
-    /// `TurnCompleted` を出して turn を閉じ、process を止めて `EngineExited` を出す（host は終了する。
-    /// 呼び手が作り直す）。期限の前に engine が終了した・接続が切れた時は、今までどおり
+    /// engine が [`HostOptions::cancel_grace`] の間に中断した turn を閉じなければ、host は process を
+    /// 止めて終了し（呼び手が作り直す）、`TurnCompleted`（turn を閉じる）→（待ちの発話があれば
+    /// `Error`）→ `EngineExited` を出す。`TurnCompleted` を受けた時点で host はもう終了していて、
+    /// `submit` は Err を返す。期限の前に engine が終了した・接続が切れた時は、今までどおり
     /// `EngineExited` だけで、`TurnCompleted` は出ない（turn の終わりとして扱うのは呼び手）。
     pub fn interrupt(&self) -> Result<(), HostError> {
         self.send(Command::Interrupt)

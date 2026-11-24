@@ -144,6 +144,7 @@ VP に残すもの:
 - **chat を開く時は `attach()`**。`history()` と `subscribe()` を別々に呼ばない
 - **`is_finished()` が true の host は使わない**。chat を開く時に見て、終了していたら作り直す
   - `is_finished()` が true になってから `Error` / `EngineExited` が出るまで、最大 1 秒ある（stderr の読み切り）。その間に host を捨てて作り直すと、古い host の受け口を読むのをやめた時点で、「待っていた発話 N 件は送られていません」などの文は届かない。文を画面に出したい呼び手は、`EngineExited` を読んでから捨てる
+- **`TurnCompleted` を受けても、host が終了していることがある**（中断に答えない engine を待ち切りで止めた時）。turn の終わりを見て次の発話を送る呼び手は、`submit()` の Err か `is_finished()` を見て作り直す。続けて `EngineExited` が出る
 - **log の target は `agent_chat_acp`**。host の警告（load に失敗して新規に替えた、未対応の要求を断った、など）は `tracing` でこの target に出る。consumer の log の filter にこの target が無いと、警告が log から消える（VP は filter に足した）
 - **`permission` と `on_session` に重い処理を置かない**（接続全体が止まる）。`on_stderr` も同じく軽くする（こちらは stderr を読む task の中で呼ばれる）
 
@@ -204,7 +205,7 @@ VP の `AcpAgentHost` に近い形にして、Stage 2 の差し替えを小さ�
   - `restart()` の命令より後に `submit` された発話は、命令の列に残り、立て直した接続で送られる。その間も待ちに入っているので、`restart()` が返す控えの末尾に出る（意図した動き。テストは無い）
 - **会話の確定の前の `interrupt()` は、「送ってから止める」になる**（VP の手書きの host との違い）。`interrupt()` は命令の列に並ぶので、確定の前に「`submit(A)` → `interrupt()`」と呼ぶと、確定の後に「A を受け取る → turn の最中でないのですぐ A を送る → 中断（A の turn を `session/cancel`）」の順で処理される。A は engine に届き、控えにも入る。VP の手書きの host は、確定の前でも待ちをその場で捨てていたので、A は送られなかった。起きるのは「chat を開いて 2 秒ほどの間に送って、すぐ止めた」時だけなので、今は直していない（code を読んで確かめた。この順を見るテストは無い）。`stop()` は別で、確定の前でも先に効く
 - `interrupt()` は、今の turn を中断し（`session/cancel`）、待たせていた発話も捨てる。turn の最中でなくても待ちは捨てる。捨てた発話は送られず、控えにも入らない（控えには送信の時に入れるため）。捨てた件数は返さない
-- **中断に答えない engine は止める**。engine が `HostOptions::cancel_grace`（既定 3 秒）の間に中断した turn を閉じなければ、engine が固まったとみなし、host が `TurnCompleted` を出して turn を閉じ、process を止めて `EngineExited` を出す（host は終了する。呼び手が作り直す）。期限の数え始めは最初の中断で、中断を重ねても延ばさない。期限は turn の終わりで下ろし、次の turn へ持ち越さない。期限の待ちの間に受け取った発話は送らず、`TurnCompleted` の後、`EngineExited` の前に `Error` で件数を知らせる
+- **中断に答えない engine は止める**。engine が `HostOptions::cancel_grace`（既定 3 秒）の間に中断した turn を閉じなければ、engine が固まったとみなし、host は process を止めて終了し（呼び手が作り直す）、`TurnCompleted`（turn を閉じる）→ `EngineExited` を出す。`TurnCompleted` が出るのは中断から 3〜4 秒後（期限 3 秒の後、stderr の読み切りを最大 1 秒待ってから出す）。期限の数え始めは最初の中断で、中断を重ねても延ばさない。期限は turn の終わりで下ろし、次の turn へ持ち越さない。期限の待ちの間に受け取った発話は送らず、`TurnCompleted` の後、`EngineExited` の前に `Error` で件数を知らせる
   - 理由: agy が thinking のまま 3000 秒以上固まり、停止を押しても `session/cancel` に答えず、turn が閉じなかった。呼び手（VP の GUI）は turn の終わりを見るまで「応答中」のままで、次の発話も送れなかった（2026-11-24、mako の報告）。実測の応答は 2〜14 ms（実測 5）なので、答える engine を 3 秒で止めることは無い見込み。ただし grok / opencode の中断の速さと、長い tool の実行中の中断の速さは測っていない
   - `TurnCompleted` は host が終了した後（`submit` が Err を返す状態）に出す。それを見て呼び手が次の発話を送っても、固まった engine に積まれて黙って失われることが無く、Err を見て host を作り直せる。この順は同じ task の中の並びで守っている（テストは current_thread の runtime なので、並びの崩れを赤にできない）
   - 期限の前に engine が終了した・接続が切れた時は、今までどおり `EngineExited` だけで、`TurnCompleted` は出ない。turn の終わりとして扱うのは呼び手（VP は `EngineExited` も turn の終わりとして扱う）
@@ -245,7 +246,7 @@ pub struct HostOptions {
     pub establish_timeout: Duration,
     /// 設定の応答を待つ上限（既定 15 秒）。当て直しは全体で、会話中の切替は 1 回ごと
     pub config_timeout: Duration,
-    /// 中断の後、engine が turn を閉じるのを待つ上限（既定 3 秒）。超えたら turn を閉じて process を止める
+    /// 中断の後、engine が turn を閉じるのを待つ上限（既定 3 秒）。超えたら process を止め、TurnCompleted → EngineExited を出す
     pub cancel_grace: Duration,
     /// spawn 後に当て直す (config id, 値)。agy は load の後に既定へ戻る（VP design 88 §6.1）
     pub config_intent: Vec<(String, String)>,

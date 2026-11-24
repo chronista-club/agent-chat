@@ -1900,11 +1900,14 @@ async fn answered_interrupt_does_not_carry_the_deadline_into_the_next_turn() {
     f.until_turn_end().await;
 
     f.host.submit("second", &[]).unwrap();
+    let started = tokio::time::Instant::now();
     let events = f.until_turn_end().await;
     assert!(events.contains(&msg("2")), "{events:?}");
+    // 持ち越した期限（3 秒）で切られていたら、turn の終わりは 3 秒で来る。
     assert!(
-        !events.iter().any(|e| matches!(e, E::EngineExited { .. })),
-        "{events:?}"
+        started.elapsed() >= Duration::from_secs(4),
+        "turn の終わりは engine が 4 秒後に出したもの: {:?}",
+        started.elapsed()
     );
     assert!(!f.host.is_finished());
 }
