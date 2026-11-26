@@ -7,7 +7,8 @@
  *
  * 選択は確定値（host の `codex_config`）が届くまで画面に反映しない（`changeCodexSelection`）。
  */
-import { For, Show, type JSX } from 'solid-js'
+import { For, Show } from 'solid-js'
+import type { JSX } from '@solidjs/web'
 import type { CodexConfigView } from './generated/CodexConfigView'
 import type { CodexRuntime } from './generated/CodexRuntime'
 
