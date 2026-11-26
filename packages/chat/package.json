@@ -12,6 +12,7 @@
     "./images": "./src/images.tsx"
   },
   "peerDependencies": {
-    "solid-js": "^1.9.0"
+    "solid-js": "^2.0.0",
+    "@solidjs/web": "^2.0.0"
   }
 }
