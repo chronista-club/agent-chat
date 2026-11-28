@@ -39,6 +39,10 @@ struct Turn {
     eof: bool,
     /// updates を送った後、応答しない。`session/cancel` にも答えない（固まった engine）。
     hang: bool,
+    /// updates を送った後、次の `session/prompt` が届いた瞬間に `end_turn` で応答する
+    /// （agy の steer: 後の prompt が前の prompt を引き継ぎ、前の応答だけ先に返る）。
+    /// `error` と組むと、その応答を error にする。
+    superseded_by_next: bool,
 }
 
 /// 接続 1 本ぶんの台本。
@@ -86,8 +90,10 @@ async fn fake_agent(mut peer: Channel, mut script: Script, log: Log) {
         return;
     }
     let mut session = "new-1".to_string();
-    let mut pending_prompt = None;
+    // 中断を待っている prompt（steer では複数）。`session/cancel` で全部 cancelled で返す。
+    let mut pending_prompts = Vec::new();
     let mut pending_permission = None;
+    let mut superseded = None;
     while let Some(frame) = peer.rx.next().await {
         let TransportFrame::Single(message) = frame else {
             continue;
@@ -160,9 +166,22 @@ async fn fake_agent(mut peer: Channel, mut script: Script, log: Log) {
                         }
                     }
                     "session/prompt" => {
+                        // 引き継がれた前の prompt は、後の prompt を受け取った瞬間に終わる（agy の実測）。
+                        if let Some((id, error)) = superseded.take() {
+                            let result = if error {
+                                Err(agent_client_protocol::Error::internal_error())
+                            } else {
+                                Ok(json!({"stopReason": "end_turn"}))
+                            };
+                            send(&peer, RawJsonRpcMessage::response(id, result));
+                        }
                         let turn = script.turns.pop_front().unwrap_or_default();
                         for u in &turn.updates {
                             update(&peer, &session, u);
+                        }
+                        if turn.superseded_by_next {
+                            superseded = Some((request.id.clone(), turn.error));
+                            continue;
                         }
                         if turn.eof {
                             return;
@@ -208,7 +227,7 @@ async fn fake_agent(mut peer: Channel, mut script: Script, log: Log) {
                             continue;
                         }
                         if turn.wait_cancel {
-                            pending_prompt = Some(request.id.clone());
+                            pending_prompts.push(request.id.clone());
                             continue;
                         }
                         if !turn.delay.is_zero() {
@@ -229,13 +248,13 @@ async fn fake_agent(mut peer: Channel, mut script: Script, log: Log) {
                     notification.method.to_string(),
                     params(notification.params.as_ref()),
                 ));
-                if &*notification.method == "session/cancel"
-                    && let Some(id) = pending_prompt.take()
-                {
-                    send(
-                        &peer,
-                        RawJsonRpcMessage::response(id, Ok(json!({"stopReason": "cancelled"}))),
-                    );
+                if &*notification.method == "session/cancel" {
+                    for id in pending_prompts.drain(..) {
+                        send(
+                            &peer,
+                            RawJsonRpcMessage::response(id, Ok(json!({"stopReason": "cancelled"}))),
+                        );
+                    }
                 }
             }
             RawJsonRpcMessage::Response(response) => {
@@ -2732,4 +2751,191 @@ async fn url_elicitation_returns_invalid_params() {
             .1["error"]["code"],
         -32602
     );
+}
+
+fn steer() -> HostOptions {
+    HostOptions {
+        steer: true,
+        ..HostOptions::default()
+    }
+}
+
+/// steer: turn の最中の発話は待たずに送る。engine が前の prompt を先に終えても（agy の
+/// Superseded）turn は閉じず、最後の prompt の応答で `TurnCompleted` を 1 回だけ出す。
+#[tokio::test]
+async fn steer_sends_mid_turn_prompt_at_once_and_closes_the_turn_once() {
+    let turns = [
+        Turn {
+            updates: vec![agent_text("1")],
+            superseded_by_next: true,
+            ..Turn::default()
+        },
+        Turn {
+            updates: vec![agent_text("2")],
+            delay: Duration::from_millis(100),
+            ..Turn::default()
+        },
+    ];
+    let mut f = start(
+        vec![Script {
+            turns: turns.into(),
+            ..Script::default()
+        }],
+        steer(),
+    );
+    f.host.submit("first", &[]).unwrap();
+    f.until(|e| matches!(e, E::MessageChunk { .. })).await;
+    // 1 つ目の prompt は後の prompt が届くまで応答しない。ここで送られなければ待ち切れずに落ちる。
+    f.host.submit("second", &[]).unwrap();
+    let events = f.until_turn_end().await;
+    assert!(
+        events.contains(&msg("2")),
+        "2 つ目の応答の後に閉じる: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, E::TurnCompleted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(f.params_of("session/prompt").len(), 2);
+    // 1 つ目の応答で余計な TurnCompleted が後から出ていない。
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(f.events.try_recv().is_err(), "turn の終わりは 1 回だけ");
+    assert_eq!(
+        f.host.history().await.unwrap().events,
+        [user("first"), msg("1"), user("second"), msg("2")]
+    );
+}
+
+/// steer で 2 本の prompt がどちらも応答を待っている最中の中断は、`session/cancel` を 1 回だけ送り、
+/// 2 本とも応答してから turn を 1 回閉じる。
+#[tokio::test]
+async fn steer_interrupt_closes_the_turn_after_every_prompt_answers() {
+    let turns = [
+        Turn {
+            updates: vec![agent_text("1")],
+            wait_cancel: true,
+            ..Turn::default()
+        },
+        Turn {
+            updates: vec![agent_text("2")],
+            wait_cancel: true,
+            ..Turn::default()
+        },
+    ];
+    let mut f = start(
+        vec![Script {
+            turns: turns.into(),
+            ..Script::default()
+        }],
+        steer(),
+    );
+    f.host.submit("first", &[]).unwrap();
+    f.until(|e| *e == msg("1")).await;
+    f.host.submit("second", &[]).unwrap();
+    // どちらの prompt もまだ応答していない（中断を待っている）。
+    let events = f.until(|e| *e == msg("2")).await;
+    assert!(
+        !events.iter().any(|e| matches!(e, E::TurnCompleted { .. })),
+        "{events:?}"
+    );
+    assert_eq!(f.params_of("session/prompt").len(), 2);
+    f.host.interrupt().unwrap();
+    let events = f.until_turn_end().await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, E::TurnCompleted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(f.params_of("session/cancel").len(), 1);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(f.events.try_recv().is_err(), "turn の終わりは 1 回だけ");
+    // turn が閉じた後は、次の発話がふつうに 1 件の turn になる。
+    f.host.submit("third", &[]).unwrap();
+    f.until_turn_end().await;
+    assert_eq!(f.params_of("session/prompt").len(), 3);
+}
+
+/// steer: 中断の後、engine が turn を閉じる前に送った発話は、待ちに戻して turn の終わりに送る。
+/// 落ちるべき壊し方: 中断の待ち中も steer で送る — 後の prompt に中断の期限がかかったまま残り、
+/// 期限（ここでは 300 ms）より長い普通の turn で engine が止められる（Abandoned）。
+#[tokio::test]
+async fn steer_waits_for_the_interrupted_turn_before_sending() {
+    let turns = [
+        Turn {
+            updates: vec![agent_text("1")],
+            wait_cancel: true,
+            ..Turn::default()
+        },
+        Turn {
+            updates: vec![agent_text("2")],
+            delay: Duration::from_millis(600),
+            ..Turn::default()
+        },
+    ];
+    let mut f = start(
+        vec![Script {
+            turns: turns.into(),
+            ..Script::default()
+        }],
+        HostOptions {
+            steer: true,
+            cancel_grace: Duration::from_millis(300),
+            ..HostOptions::default()
+        },
+    );
+    f.host.submit("first", &[]).unwrap();
+    f.until(|e| *e == msg("1")).await;
+    f.host.interrupt().unwrap();
+    f.host.submit("second", &[]).unwrap();
+    f.until_turn_end().await;
+    let events = f.until_turn_end().await;
+    assert!(events.contains(&msg("2")), "{events:?}");
+    assert!(
+        !events.iter().any(|e| matches!(e, E::EngineExited { .. })),
+        "{events:?}"
+    );
+}
+
+/// steer: 途中の応答（引き継がれた前の prompt）の失敗は `Notice` で知らせる。`Error` は受け手が
+/// turn の終わりとして扱う（VP の GUI は停止ボタンを畳む）ので、turn の続いている間は出さない。
+#[tokio::test]
+async fn steer_reports_a_failed_superseded_prompt_without_ending_the_turn() {
+    let turns = [
+        Turn {
+            updates: vec![agent_text("1")],
+            superseded_by_next: true,
+            error: true,
+            ..Turn::default()
+        },
+        Turn {
+            updates: vec![agent_text("2")],
+            delay: Duration::from_millis(100),
+            ..Turn::default()
+        },
+    ];
+    let mut f = start(
+        vec![Script {
+            turns: turns.into(),
+            ..Script::default()
+        }],
+        steer(),
+    );
+    f.host.submit("first", &[]).unwrap();
+    f.until(|e| *e == msg("1")).await;
+    f.host.submit("second", &[]).unwrap();
+    let events = f.until_turn_end().await;
+    assert!(
+        !events.iter().any(|e| matches!(e, E::Error { .. })),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, E::Notice { .. })),
+        "{events:?}"
+    );
+    assert!(events.contains(&msg("2")), "{events:?}");
 }
