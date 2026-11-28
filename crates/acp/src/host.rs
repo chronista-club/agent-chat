@@ -105,6 +105,12 @@ pub struct HostOptions {
     /// process にだけ効く（[`AcpClientHost::spawn_with`] では connector の側で渡す）。
     pub on_stderr: StderrCallback,
     pub history_limits: HistoryLimits,
+    /// turn の最中に `submit` された発話を、turn の終わりを待たずに engine へ送る（steer）。
+    /// engine が「走っている turn に後から prompt を足す」ことを受け付ける時だけ true にする
+    /// （agy は公式に対応: 後の prompt を受けると前の prompt を `end_turn` で先に返し、同じ turn の
+    /// 続きとして後の指示を取り込む。grok は受理して順に答える。設計書 01「steer」）。false（既定）は
+    /// 従来どおり、turn の終わりを待って 1 件ずつ送る。
+    pub steer: bool,
 }
 
 impl Default for HostOptions {
@@ -120,6 +126,7 @@ impl Default for HostOptions {
             on_session: Arc::new(|_| Ok(())),
             on_stderr: Arc::new(|_| {}),
             history_limits: HistoryLimits::default(),
+            steer: false,
         }
     }
 }
@@ -974,7 +981,10 @@ struct Connection {
     session_id: String,
     translator: AcpTranslator,
     queue: VecDeque<(String, Vec<PromptImage>)>,
-    in_turn: bool,
+    /// engine へ送って、まだ応答（`PromptResponse`）が返っていない `session/prompt` の数。
+    /// 1 以上の間が turn の最中。steer（[`HostOptions::steer`]）では 2 以上になりうる: 後の
+    /// prompt が前の prompt を引き継ぐと、engine は前の応答を先に返し、turn は後の応答で終わる。
+    open_prompts: usize,
     /// turn の最中に slash command が変わった。turn の終わりに `SessionInit` を出し直す。
     init_deferred: bool,
     /// 中断した turn を engine が閉じるのを待つ期限（[`HostOptions::cancel_grace`]）。
@@ -1071,7 +1081,7 @@ async fn establish(
         session_id: session_id.clone(),
         translator: AcpTranslator::new(),
         queue: VecDeque::new(),
-        in_turn: false,
+        open_prompts: 0,
         init_deferred: false,
         cancel_deadline: None,
         initializing: true,
@@ -1249,7 +1259,7 @@ impl Connection {
                         let dropped = dropped.min(shared.pending.len());
                         shared.pending.drain(..dropped);
                         drop(shared);
-                        if self.in_turn {
+                        if self.in_turn() {
                             if let Err(e) = cx.send_notification(CancelNotification::new(
                                 self.session_id.clone(),
                             )) {
@@ -1288,7 +1298,7 @@ impl Connection {
                         config_pending += 1;
                     }
                     Some(Command::Restart { reply }) => {
-                        if self.in_turn || !self.queue.is_empty() || config_pending > 0 {
+                        if self.in_turn() || !self.queue.is_empty() || config_pending > 0 {
                             let _ = reply.send(Err(HostError::Busy));
                         } else {
                             return Exit::Restart(reply);
@@ -1302,13 +1312,33 @@ impl Connection {
         }
     }
 
-    /// 待っている発話があり、turn の最中でなければ、次の 1 件を送る。
+    /// turn の最中か（engine の応答を待っている prompt がある）。
+    fn in_turn(&self) -> bool {
+        self.open_prompts > 0
+    }
+
+    /// 待っている発話を送る。steer なら turn の最中でも待ちを全部送る（engine が今の turn に
+    /// 取り込む）。そうでなければ、turn の最中でない時に次の 1 件だけ送る。
+    ///
+    /// 中断の後、engine が turn を閉じるまで（`cancel_deadline` が立っている間）は steer でも送らず、
+    /// turn の終わりまで待ちに残す。送ってしまうと、中断より後の普通の prompt にも中断の期限が
+    /// かかり、期限より長い turn で engine を止めてしまう（moody-blues の指摘、2026-11-28）。
+    /// 停止の後の発話は次の turn に回る、という意図にも合う。
     fn send_next(&mut self, ctx: &Arc<Ctx>) -> Result<(), String> {
-        if self.in_turn {
-            return Ok(());
+        loop {
+            if self.in_turn() && (!ctx.options.steer || self.cancel_deadline.is_some()) {
+                return Ok(());
+            }
+            if !self.send_one(ctx)? {
+                return Ok(());
+            }
         }
+    }
+
+    /// 待ちの先頭を 1 件送る。待ちが空なら false。
+    fn send_one(&mut self, ctx: &Arc<Ctx>) -> Result<bool, String> {
         let Some((text, images)) = self.queue.pop_front() else {
-            return Ok(());
+            return Ok(false);
         };
         let mut blocks = vec![ContentBlock::Text(TextContent::new(text.clone()))];
         blocks.extend(
@@ -1319,14 +1349,14 @@ impl Connection {
         self.session
             .send_prompt_blocks(blocks)
             .map_err(|e| e.to_string())?;
-        self.in_turn = true;
+        self.open_prompts += 1;
         let mut shared = ctx.shared();
         shared.in_turn = true;
         // 送ったので、待ちから控えへ移す。控えには送信の時の text を入れる
         // （engine が返す写しには頼らない）。送信に失敗した時は、待ちに残したまま抜けている。
         shared.pending.pop_front();
         shared.history.push(ConversationEvent::UserMessage { text });
-        Ok(())
+        Ok(true)
     }
 
     /// engine からの 1 件。`replay` は load が流した過去の会話（控えにだけ入れる）。
@@ -1414,7 +1444,7 @@ impl Connection {
         }
         if let Some(chunk) = self.translator.ingest_user_chunk(update) {
             // host が出した発話の写し。UI は送信の時に表示済みで、控えにも入れてある。
-            if !replay && self.in_turn {
+            if !replay && self.in_turn() {
                 return;
             }
             let mut shared = ctx.shared();
@@ -1437,7 +1467,7 @@ impl Connection {
                 continue;
             }
             // host が出した発話の写し。UI は送信の時に表示済みで、控えにも入れてある。
-            if self.in_turn && matches!(event, ConversationEvent::UserMessage { .. }) {
+            if self.in_turn() && matches!(event, ConversationEvent::UserMessage { .. }) {
                 continue;
             }
             // 控えへの追加と送信を同じ lock の中で行う（`attach` が抜けも重なりも無く取れる）。
@@ -1452,7 +1482,7 @@ impl Connection {
         if replay || self.initializing {
             return; // 確定の時にまとめて出す
         }
-        if self.in_turn {
+        if self.in_turn() {
             self.init_deferred = true;
         } else if let Some(init) = ctx.build_session_init() {
             ctx.emit(init);
@@ -1481,13 +1511,25 @@ impl Connection {
         ctx: &Arc<Ctx>,
         result: Result<PromptResponse, agent_client_protocol::Error>,
     ) {
+        self.open_prompts = self.open_prompts.saturating_sub(1);
+        // steer で引き継いだ後の prompt がまだ走っている（engine は前の prompt を先に返す）。
+        // turn は続いているので、質問も中断の期限も保留した SessionInit もそのまま持ち越す。
+        if self.in_turn() {
+            // 途中の失敗は `Notice` で知らせる。`Error` は受け手が turn の終わりとして扱う
+            // （VP の GUI は停止ボタンを畳む）ので、turn が続いている間は出さない。
+            if let Err(e) = result {
+                ctx.emit(ConversationEvent::Notice {
+                    message: format!("前の発話への応答が失敗しました（{e}）。turn は続いています"),
+                });
+            }
+            return;
+        }
         self.cancel_elicitations(Some(ctx));
         if let Err(e) = result {
             ctx.emit(ConversationEvent::Error {
                 message: e.to_string(),
             });
         }
-        self.in_turn = false;
         // 中断の期限を次の turn へ持ち越さない。
         self.cancel_deadline = None;
         // 保留した SessionInit は TurnCompleted の前に出す（VP の手書きの host と同じ並び）。

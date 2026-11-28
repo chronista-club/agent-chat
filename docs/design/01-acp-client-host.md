@@ -198,7 +198,17 @@ agy 1.5.9 は会話中も、送った発話を `user_message_chunk` で返して
 
 VP の `AcpAgentHost` に近い形にして、Stage 2 の差し替えを小さくする。実装は `crates/acp/src/host.rs`。下は要点で、正は code。
 
-- `submit` / `interrupt` / `stop` は待たない（命令を queue に入れるだけ）。turn の最中の `submit` は、終わってから順に送る
+- `submit` / `interrupt` / `stop` は待たない（命令を queue に入れるだけ）。turn の最中の `submit` は、終わってから順に送る（既定）。`HostOptions::steer` が true なら待たずにすぐ送る（下の「steer」）
+- **steer（`HostOptions::steer`、既定 false）**: turn の最中に `submit` された発話を、turn の終わりを待たずに `session/prompt` として送る。engine が「走っている turn に後から prompt を足す」ことを受け付ける時だけ true にする（VP は agy と grok）
+  - agy 1.5.18 の実測（2026-11-28、VP の lead）: 1 本目の `session/prompt`（`sleep 3` の tool を実行中）の最中に 2 本目を送ると、2 本目を受けた瞬間に 1 本目が `stopReason: end_turn` で返る（agy の中では `Lease.Superseded`）。実行中の tool は中断されずに終わり（`tool_call_update`）、同じ turn の続きとして 2 本目の指示を取り込んで答え、最後に 2 本目が `end_turn` で返る
+  - grok 1.0.92 の実測（同日、VP の lead）: エラーにせず受理し、1 本目の答え → 1 本目の応答 → 2 本目の答え → 2 本目の応答、の順に返す（engine の中で順に処理する）。host から見た形は agy と同じ（前の応答が先、turn は後の応答で終わる）
+  - host は送って応答が返っていない prompt の数（`Connection::open_prompts`。`attach` の `in_flight` とは別物）を数え、**0 になった時だけ turn を閉じる**（`TurnCompleted`、答えていない質問の `PermissionCancelled`、中断の期限を下ろす、保留した `SessionInit` を出す）。途中の応答（引き継がれた前の prompt）では何も閉じない。途中の応答が error なら `Error` ではなく `Notice` で知らせる（`Error` は受け手が turn の終わりとして扱う。VP の GUI は停止ボタンを畳む）
+  - 中断は 1 回の `session/cancel` で、走っている prompt が全部応答した時に turn を 1 回閉じる。期限（`cancel_grace`）は今までどおり
+  - 中断の後、engine が turn を閉じるまで（期限が立っている間）は steer でも送らず、turn の終わりまで待ちに残す。送ると中断より後の普通の prompt にも期限がかかり、期限より長い turn で engine を止めてしまう（moody-blues の指摘）
+  - 控えには送った順に `UserMessage` が入る。engine が返す自分の発話の写しは、turn の最中なので今までどおり読み飛ばす
+  - false を既定にした理由: この host は opencode / muse も使う。それらの engine に、応答を待たずに次の prompt を送るとどう振る舞うかは測っていない
+  - テスト: `steer_sends_mid_turn_prompt_at_once_and_closes_the_turn_once`（偽の agent に agy の Superseded の振る舞いを `superseded_by_next` で入れた）/ `steer_interrupt_closes_the_turn_after_every_prompt_answers`（2 本とも応答を待っている時の中断）/ `steer_waits_for_the_interrupted_turn_before_sending` / `steer_reports_a_failed_superseded_prompt_without_ending_the_turn`
+  - 未測定: grok で 2 本が走っている時に `session/cancel` 1 回で両方が応答するか（片方しか答えなければ期限で engine を止める）
 - **受け取ってまだ送っていない発話も、`history()` / `attach()` の末尾に入る**（待ちの順の `UserMessage`）。待ちがあれば `in_flight` は true（これから turn が走る）。送った時に待ちから控えへ移るので、同じ発話が 2 回出ることは無い。`interrupt()` で捨てた分は消える
   - 理由: 呼び手は控えで画面を作り直す（`ReplayStart` で表示を消す）。会話の確定（1.5〜2 秒）や設定の当て直しを待っている間に利用者が送った発話は、まだ engine に送っていないが、利用者から見れば送った発話。控えに無いと画面から消え、次の答えが前の答えの吹き出しにつながって見える（VP の acp-stage2 lane の自己レビューが見つけた、2026-11-20）
   - 待ちの発話は控えの上限（`HistoryLimits`）の勘定の外。画像は入らない（`UserMessage` は text だけ）
