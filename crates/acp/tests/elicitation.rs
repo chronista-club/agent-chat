@@ -209,3 +209,61 @@ fn other_suffix_without_base_stays_a_plain_question() {
         json!({"note_other":"hi"})
     );
 }
+
+/// agy の oneOf は const が番号なので、数字の title が別の選択肢の const と重なることがある。
+/// ボタンの label を先に引き、const は label に無い時だけ引く。
+#[test]
+fn one_of_label_wins_over_another_options_const() {
+    for kind in ["string", "array"] {
+        let one_of =
+            json!([{"const":"1","title":"4"},{"const":"2","title":"2"},{"const":"3","title":"1"}]);
+        let prop = if kind == "array" {
+            json!({"type":"array","title":"Workers?","items":{"type":"string","oneOf":one_of}})
+        } else {
+            json!({"type":"string","title":"Workers?","oneOf":one_of})
+        };
+        let (_, fields) =
+            parse_elicitation_questions(&json!({"requestedSchema":{"properties":{"q1":prop}}}))
+                .unwrap();
+        let (answer, expected) = if kind == "array" {
+            ("4, 1", json!({"q1":["1","3"]}))
+        } else {
+            ("1", json!({"q1":"3"}))
+        };
+        assert_eq!(
+            build_elicitation_content(&fields, &json!({"Workers?": answer})),
+            expected,
+            "{kind}"
+        );
+    }
+}
+
+/// title が重なると label から const を引けないので、ボタンは const を出す。
+#[test]
+fn duplicate_one_of_titles_fall_back_to_consts() {
+    let (questions, fields) = parse_elicitation_questions(&json!({"requestedSchema":{"properties":{
+        "q":{"type":"string","title":"Pick","oneOf":[{"const":"a","title":"Same"},{"const":"b","title":"Same"}]}
+    }}}))
+    .unwrap();
+    let labels: Vec<_> = questions[0]
+        .options
+        .iter()
+        .map(|o| o.label.as_str())
+        .collect();
+    assert_eq!(labels, ["a", "b"]);
+    assert_eq!(
+        build_elicitation_content(&fields, &json!({"Pick":"b"})),
+        json!({"q":"b"})
+    );
+}
+
+/// 対の質問の回答は PromptCard の label だけ。Other に const と同じ文字列を書いても自由記述として返す。
+#[test]
+fn write_in_equal_to_a_const_stays_a_write_in() {
+    let (questions, fields) = parse_elicitation_questions(&agy_one_of_form()).unwrap();
+    let q = &questions[0].question;
+    assert_eq!(
+        build_elicitation_content(&fields, &json!({ q: "1" })),
+        json!({"q1_other":"1"})
+    );
+}
