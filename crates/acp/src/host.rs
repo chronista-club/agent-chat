@@ -1229,7 +1229,7 @@ impl Connection {
                         let _ = reply.send(result);
                     }
                     Some(Command::Interrupt) => {
-                        self.cancel_elicitations();
+                        self.cancel_elicitations(Some(ctx));
                         // 待たせていた発話も捨てる。止めたのに次の発話が走り出さないように
                         // （VP の codex / vpcode / 手書きの ACP の host と同じ）。捨てた発話は
                         // まだ送っていないので、控えにも入っていない。
@@ -1451,9 +1451,19 @@ impl Connection {
         }
     }
 
-    fn cancel_elicitations(&mut self) {
-        for (_, (responder, _)) in self.pending_elicitations.drain() {
+    /// 答えていない質問を engine へ `cancel` で閉じる。`ctx` があれば id ごとに
+    /// `PermissionCancelled` を出す — UI が答え先の無くなったカードだけを閉じられるように
+    /// （claude の `control_cancel_request` と同じ event。turn の終わりで一律に閉じると、turn を
+    /// またいで答えを待つ engine のカードまで閉じてしまう）。
+    ///
+    /// `Drop`（立て直し・停止）では ctx が無いので出さない。その時は接続が終わるので、UI は
+    /// `EngineExited` で残りのカードを閉じる。
+    fn cancel_elicitations(&mut self, ctx: Option<&Arc<Ctx>>) {
+        for (request_id, (responder, _)) in self.pending_elicitations.drain() {
             let _ = responder.respond(serde_json::json!({"action":"cancel"}));
+            if let Some(ctx) = ctx {
+                ctx.emit(ConversationEvent::PermissionCancelled { request_id });
+            }
         }
     }
 
@@ -1462,7 +1472,7 @@ impl Connection {
         ctx: &Arc<Ctx>,
         result: Result<PromptResponse, agent_client_protocol::Error>,
     ) {
-        self.cancel_elicitations();
+        self.cancel_elicitations(Some(ctx));
         if let Err(e) = result {
             ctx.emit(ConversationEvent::Error {
                 message: e.to_string(),
@@ -1502,6 +1512,6 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        self.cancel_elicitations();
+        self.cancel_elicitations(None);
     }
 }

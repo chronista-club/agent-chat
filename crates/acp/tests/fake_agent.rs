@@ -2552,7 +2552,13 @@ async fn elicitation_accept_cancel_and_unknown_id() {
             .respond_permission(request_id, Some(answers), cancel)
             .await
             .unwrap();
-        f.until_turn_end().await;
+        let rest = f.until_turn_end().await;
+        assert!(
+            !rest
+                .iter()
+                .any(|e| matches!(e, E::PermissionCancelled { .. })),
+            "答えた質問は打ち切りとして知らせない: {rest:?}"
+        );
         assert!(
             f.host
                 .respond_permission(request_id, None, true)
@@ -2588,9 +2594,19 @@ async fn interrupt_cancels_pending_elicitation() {
     );
     f.until(|e| matches!(e, E::SessionInit { .. })).await;
     f.host.submit("ask", &[]).unwrap();
-    f.until(|e| matches!(e, E::Question { .. })).await;
+    let asked = f.until(|e| matches!(e, E::Question { .. })).await;
+    let Some(E::Question { request_id, .. }) = asked.last() else {
+        unreachable!()
+    };
     f.host.interrupt().unwrap();
-    f.until_turn_end().await;
+    let events = f.until_turn_end().await;
+    // 打ち切った質問は id ごとに知らせる（UI が答え先の無いカードを閉じるため）
+    assert!(
+        events.contains(&E::PermissionCancelled {
+            request_id: request_id.clone()
+        }),
+        "{events:?}"
+    );
     let log = f.log.lock().unwrap();
     let response = &log
         .iter()
@@ -2626,6 +2642,19 @@ async fn turn_end_cancels_unanswered_elicitation() {
             }
         })
         .unwrap();
+    // turn の終わりで打ち切った質問を、turn の終わりより前に知らせる
+    let cancelled = events.iter().position(|e| {
+        *e == E::PermissionCancelled {
+            request_id: request_id.clone(),
+        }
+    });
+    let ended = events
+        .iter()
+        .position(|e| matches!(e, E::TurnCompleted { .. }));
+    assert!(
+        matches!((cancelled, ended), (Some(c), Some(t)) if c < t),
+        "{events:?}"
+    );
     assert!(
         f.host
             .respond_permission(&request_id, None, true)
