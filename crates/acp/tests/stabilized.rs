@@ -89,10 +89,11 @@ fn full_messages_are_translated() {
 }
 
 #[test]
-fn tool_updates_start_once_use_programmatic_name_and_finish_cancelled() {
+fn tool_updates_start_once_prefer_title_and_finish_cancelled() {
     let mut tr = AcpTranslator::new();
     let events = tr.ingest(&json!({"sessionUpdate":"tool_call_update","toolCallId":"t","name":"read_file","title":"Reading file","status":"in_progress"}));
-    assert!(matches!(&events[..], [E::ToolCall{name,..}] if name=="read_file"));
+    // 表示名は title が先（name は title が無い時だけ。translate の単体 test）
+    assert!(matches!(&events[..], [E::ToolCall{name,..}] if name=="Reading file"));
     assert!(
         tr.ingest(
             &json!({"sessionUpdate":"tool_call_update","toolCallId":"t","status":"in_progress"})
@@ -108,7 +109,7 @@ fn tool_updates_start_once_use_programmatic_name_and_finish_cancelled() {
 fn structured_diff_renders_paths_and_patch() {
     let mut tr = AcpTranslator::new();
     let events = tr.ingest(&json!({"sessionUpdate":"tool_call","toolCallId":"t","name":"edit_file","title":"Edit","status":"completed","content":[{"type":"diff","changes":[{"type":"modify","path":"/work/a.rs"}],"patch":{"format":"git_patch","text":"-old\n+new"}}]}));
-    assert!(matches!(&events[0], E::ToolCall{name,..} if name=="edit_file"));
+    assert!(matches!(&events[0], E::ToolCall{name,..} if name=="Edit"));
     assert!(
         matches!(&events[1], E::ToolCallUpdate{content,..} if content.contains("/work/a.rs") && content.contains("-old\n+new"))
     );

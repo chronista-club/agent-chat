@@ -2026,7 +2026,7 @@ async fn load_stream_with_pending_tool_call_then_update_is_one_pair() {
             user("file を作って"),
             E::ToolCall {
                 id: "t1".into(),
-                name: "write".into(),
+                name: "write hello.txt".into(),
                 input: json!({"path": "hello.txt"}),
             },
             E::ToolCallUpdate {
