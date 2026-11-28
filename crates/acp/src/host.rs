@@ -35,7 +35,8 @@ use crate::config::{AcpConfigOption, AcpConfigView, needs_apply, parse_config_op
 use crate::history::{History, HistoryLimits, HistorySnapshot};
 use crate::permission::{self, PermissionDecision};
 use crate::session_meta::{
-    extract_available_commands, extract_current_mode, extract_session_meta, extract_usage_update,
+    extract_available_commands, extract_current_mode, extract_init_commands, extract_session_meta,
+    extract_usage_update,
 };
 use crate::translate::AcpTranslator;
 
@@ -435,6 +436,12 @@ enum Command {
         images: Vec<PromptImage>,
     },
     Interrupt,
+    RespondElicitation {
+        request_id: String,
+        answers: Option<serde_json::Value>,
+        cancel: bool,
+        reply: Reply<()>,
+    },
     SetConfig {
         id: String,
         value: String,
@@ -464,6 +471,28 @@ pub struct AcpClientHost {
 }
 
 impl AcpClientHost {
+    /// 保留中の elicitation（form）に答える。`answers` は PromptCard の回答 map（質問文 → 回答）。
+    /// `cancel = true` なら回答せず `cancel` で閉じる。未知・使用済みの `request_id` は Err。
+    pub async fn respond_permission(
+        &self,
+        request_id: &str,
+        answers: Option<serde_json::Value>,
+        cancel: bool,
+    ) -> Result<(), HostError> {
+        let (reply, receive) = oneshot::channel();
+        self.commands
+            .send(Command::RespondElicitation {
+                request_id: request_id.into(),
+                answers,
+                cancel,
+                reply,
+            })
+            .map_err(|_| HostError::Dead("connection closed".into()))?;
+        receive
+            .await
+            .map_err(|_| HostError::Dead("connection closed".into()))?
+    }
+
     /// process を起動し、initialize → `session/load`（resume あり）か `session/new` を始める。
     pub fn spawn(launch: LaunchContext, options: HostOptions) -> Result<Self, HostError> {
         let cwd = launch.cwd.clone();
@@ -755,6 +784,7 @@ async fn supervise<C: Connector>(
                 Command::Submit { .. } => {}
                 Command::Restart { reply } => drop(reply.send(Err(early.clone()))),
                 Command::SetConfig { reply, .. } => drop(reply.send(Err(early.clone()))),
+                Command::RespondElicitation { reply, .. } => drop(reply.send(Err(early.clone()))),
                 Command::Interrupt => {}
             }
         }
@@ -829,6 +859,47 @@ async fn run_connection(
     let established = std::sync::atomic::AtomicBool::new(false);
     let result = Client
         .v1()
+        .on_receive_dispatch(
+            async |message: agent_client_protocol::v1::Dispatch, _cx| {
+                match message {
+                    Dispatch::Response(mut result, router)
+                        if matches!(
+                            router.method(),
+                            "initialize"
+                                | "session/new"
+                                | "session/load"
+                                | "session/set_config_option"
+                        ) =>
+                    {
+                        // v2 形の configId / groupId を v1 の型が読める形へ（直さないと
+                        // VecSkipError で軸が黙って消える）。
+                        if let Ok(value) = &mut result {
+                            crate::config::normalize_v1_config_options(value);
+                        }
+                        // v1 の schema は応答直下の availableCommands（v2 の field）を持たない。
+                        // SDK が typed に decode する前に `_meta` へ退避して残す。
+                        if let Ok(value) = &mut result
+                            && let Some(commands) = value
+                                .get("availableCommands")
+                                .filter(|v| v.is_array())
+                                .cloned()
+                        {
+                            if !value["_meta"].is_object() {
+                                value["_meta"] = serde_json::json!({});
+                            }
+                            value["_meta"]["availableCommands"] = commands;
+                        }
+                        router.route_with_result(result)?;
+                        Ok(agent_client_protocol::Handled::Yes)
+                    }
+                    message => Ok(agent_client_protocol::Handled::No {
+                        message,
+                        retry: false,
+                    }),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
         .on_receive_request(
             async move |request: RequestPermissionRequest, responder, _cx| {
                 let outcome = match policy(&request) {
@@ -901,6 +972,14 @@ struct Connection {
     /// 中断した turn を engine が閉じるのを待つ期限（[`HostOptions::cancel_grace`]）。
     /// 最初の中断で立て、turn の終わりで下ろす。
     cancel_deadline: Option<tokio::time::Instant>,
+    initializing: bool,
+    pending_elicitations: HashMap<
+        String,
+        (
+            agent_client_protocol::v1::Responder,
+            Vec<crate::elicitation::ElicitationFieldKind>,
+        ),
+    >,
 }
 
 /// 設定の切替の応答（接続の task から命令のループへ戻す）。
@@ -916,13 +995,25 @@ async fn establish(
     ctx: &Arc<Ctx>,
     resume: Option<String>,
 ) -> Result<Connection, String> {
+    let capabilities = serde_json::from_value(serde_json::json!({
+        "elicitation": { "form": {} }, "session": { "notices": {}, "compaction": {} }, "plan": {}
+    }))
+    .map_err(|e| format!("client capabilities: {e}"))?;
     let init = cx
-        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+        .send_request(
+            InitializeRequest::new(ProtocolVersion::V1)
+                .client_info(agent_client_protocol::v1::schema::Implementation::new(
+                    "agent-chat-acp",
+                    env!("CARGO_PKG_VERSION"),
+                ))
+                .client_capabilities(capabilities),
+        )
         .block_task()
         .await
         .map_err(|e| format!("initialize: {e}"))?;
     tracing::debug!(agent = ?init.agent_info, "ACP initialize");
 
+    let init_commands = extract_init_commands(&serde_json::to_value(&init).unwrap_or_default());
     let mut loaded = None;
     if let Some(session_id) = resume {
         match cx
@@ -975,6 +1066,8 @@ async fn establish(
         in_turn: false,
         init_deferred: false,
         cancel_deadline: None,
+        initializing: true,
+        pending_elicitations: HashMap::new(),
     };
     {
         let (model, mode) = extract_session_meta(&meta);
@@ -984,14 +1077,30 @@ async fn establish(
         shared.mode = mode;
         shared.config = meta.get("configOptions").and_then(parse_config_options);
         shared.config_error = None;
+        let (commands, docs) = extract_init_commands(&meta)
+            .or(init_commands)
+            .unwrap_or_default();
+        shared.commands = commands;
+        shared.command_docs = docs;
     }
-    if replay {
+    {
         // load が流した過去の会話。応答の前に届いた分は、もう stream に溜まっている。
         while let Some(message) = conn.session.read_update().now_or_never() {
             let message = message.map_err(|e| format!("session/load の流れ: {e}"))?;
-            conn.on_message(ctx, message, true);
+            conn.on_message(ctx, message, replay);
         }
     }
+    if !replay && ctx.shared().commands.is_empty() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        while ctx.shared().commands.is_empty() {
+            match tokio::time::timeout_at(deadline, conn.session.read_update()).await {
+                Ok(Ok(message)) => conn.on_message(ctx, message, false),
+                Ok(Err(e)) => return Err(format!("initial session updates: {e}")),
+                Err(_) => break,
+            }
+        }
+    }
+    conn.initializing = false;
     if let Err(e) = (ctx.options.on_session)(&session_id) {
         ctx.emit(ConversationEvent::Error {
             message: format!("会話 ID を保存できません: {e}"),
@@ -1108,7 +1217,19 @@ impl Connection {
                             return Exit::Dead(message);
                         }
                     }
+                    Some(Command::RespondElicitation { request_id, answers, cancel, reply }) => {
+                        let result = match self.pending_elicitations.remove(&request_id) {
+                            Some((responder, fields)) => {
+                                let response = if cancel { serde_json::json!({"action":"cancel"}) }
+                                    else { serde_json::json!({"action":"accept", "content":crate::elicitation::build_elicitation_content(&fields, &answers.unwrap_or_default())}) };
+                                responder.respond(response).map_err(|e| HostError::Engine(e.to_string()))
+                            }
+                            None => Err(HostError::Engine(format!("Unknown elicitation: {request_id}"))),
+                        };
+                        let _ = reply.send(result);
+                    }
                     Some(Command::Interrupt) => {
+                        self.cancel_elicitations();
                         // 待たせていた発話も捨てる。止めたのに次の発話が走り出さないように
                         // （VP の codex / vpcode / 手書きの ACP の host と同じ）。捨てた発話は
                         // まだ送っていないので、控えにも入っていない。
@@ -1215,7 +1336,37 @@ impl Connection {
                     }
                 }
                 Dispatch::Request(request, responder) => {
-                    // permission は builder の handler が先に答える。ここに来るのは未対応の要求。
+                    if request.method() == "elicitation/create" {
+                        match crate::elicitation::parse_elicitation_questions(request.params()) {
+                            Ok((questions, fields)) => {
+                                static NEXT_ID: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(1);
+                                let request_id = format!(
+                                    "acp-elicit-{}",
+                                    NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                );
+                                if replay {
+                                    let _ =
+                                        responder.respond(serde_json::json!({"action":"cancel"}));
+                                } else {
+                                    self.pending_elicitations
+                                        .insert(request_id.clone(), (responder, fields));
+                                    ctx.emit(ConversationEvent::Question {
+                                        request_id,
+                                        questions,
+                                    });
+                                }
+                            }
+                            Err(message) => {
+                                tracing::warn!(%message, "Invalid elicitation form");
+                                let _ = responder.respond_with_error(
+                                    agent_client_protocol::Error::invalid_params(),
+                                );
+                            }
+                        }
+                        return;
+                    }
+                    // permission is handled by the builder; unknown requests are rejected.
                     tracing::warn!(method = request.method(), "未対応の要求を断る");
                     let _ = responder
                         .respond_with_error(agent_client_protocol::Error::method_not_found());
@@ -1290,7 +1441,7 @@ impl Connection {
 
     /// `SessionInit` を出し直す。turn の最中は終わりまで保留する（途中で出すと UI の状態が動く）。
     fn refresh_session_init(&mut self, ctx: &Arc<Ctx>, replay: bool) {
-        if replay {
+        if replay || self.initializing {
             return; // 確定の時にまとめて出す
         }
         if self.in_turn {
@@ -1300,11 +1451,18 @@ impl Connection {
         }
     }
 
+    fn cancel_elicitations(&mut self) {
+        for (_, (responder, _)) in self.pending_elicitations.drain() {
+            let _ = responder.respond(serde_json::json!({"action":"cancel"}));
+        }
+    }
+
     fn on_turn_end(
         &mut self,
         ctx: &Arc<Ctx>,
         result: Result<PromptResponse, agent_client_protocol::Error>,
     ) {
+        self.cancel_elicitations();
         if let Err(e) = result {
             ctx.emit(ConversationEvent::Error {
                 message: e.to_string(),
@@ -1339,5 +1497,11 @@ impl Connection {
         if let Err(message) = self.send_next(ctx) {
             ctx.emit(ConversationEvent::Error { message });
         }
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.cancel_elicitations();
     }
 }

@@ -25,6 +25,14 @@ use agent_chat_protocol::{ConversationEvent, PlanEntry};
 
 /// content block（{type:"text", text}）から text を取り出す（それ以外の type は無視）。
 fn content_text(content: &serde_json::Value) -> Option<String> {
+    if let Some(blocks) = content.as_array() {
+        let text = blocks
+            .iter()
+            .filter_map(content_text)
+            .collect::<Vec<_>>()
+            .join("");
+        return (!text.is_empty()).then_some(text);
+    }
     match content.get("type").and_then(|v| v.as_str()) {
         Some("text") => content
             .get("text")
@@ -43,6 +51,27 @@ fn tool_result_block_text(block: &serde_json::Value) -> Option<String> {
     match block.get("type").and_then(|v| v.as_str()) {
         Some("content") => block.get("content").and_then(content_text),
         Some("diff") => {
+            if let Some(changes) = block.get("changes").and_then(|v| v.as_array()) {
+                let mut lines = changes
+                    .iter()
+                    .filter_map(|change| {
+                        let path = change.get("path").and_then(|v| v.as_str());
+                        let old = change.get("oldPath").and_then(|v| v.as_str());
+                        let new = change.get("newPath").and_then(|v| v.as_str());
+                        match (path, old, new) {
+                            (Some(path), _, _) => Some(path.to_string()),
+                            (_, Some(old), Some(new)) => Some(format!("{old} → {new}")),
+                            (_, _, Some(new)) => Some(new.to_string()),
+                            (_, Some(old), _) => Some(old.to_string()),
+                            _ => None,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(patch) = block.pointer("/patch/text").and_then(|v| v.as_str()) {
+                    lines.push(patch.to_string());
+                }
+                return (!lines.is_empty()).then(|| lines.join("\n"));
+            }
             let path = block.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let old_text = block
                 .get("oldText")
@@ -97,7 +126,7 @@ fn tool_result(update: &serde_json::Value, id: &str, status: &str) -> Conversati
 }
 
 fn is_terminal(status: &str) -> bool {
-    status == "completed" || status == "failed"
+    matches!(status, "completed" | "failed" | "cancelled")
 }
 
 /// ACP `session/update` の update 層翻訳器（1 host = 1 個、turn を跨いで生存）。
@@ -128,7 +157,8 @@ impl AcpTranslator {
     /// `user_message_chunk`（text）なら、その本文と「直前の chunk の続きか」を返す。
     /// 履歴で 1 つの発話にまとめたい呼び手は、[`Self::ingest`] の前にこちらを呼ぶ。
     pub fn ingest_user_chunk(&mut self, update: &serde_json::Value) -> Option<UserChunk> {
-        if update.get("sessionUpdate").and_then(|v| v.as_str()) != Some("user_message_chunk") {
+        let kind = update.get("sessionUpdate").and_then(|v| v.as_str());
+        if !matches!(kind, Some("user_message_chunk" | "user_message")) {
             return None;
         }
         let id = update
@@ -136,7 +166,8 @@ impl AcpTranslator {
             .and_then(|v| v.as_str())
             .filter(|id| !id.is_empty())
             .map(str::to_string);
-        let continues = id.is_some() && id == self.last_user_message_id;
+        let continues =
+            kind == Some("user_message_chunk") && id.is_some() && id == self.last_user_message_id;
         self.last_user_message_id = id;
         let text = update.get("content").and_then(content_text)?;
         Some(UserChunk { text, continues })
@@ -158,24 +189,57 @@ impl AcpTranslator {
                 | "tool_call"
                 | "tool_call_update"
                 | "plan"
+                | "agent_message"
+                | "agent_thought"
+                | "plan_update"
+                | "plan_removed"
         ) {
             self.last_user_message_id = None;
         }
         match kind {
-            "agent_message_chunk" => update
+            "agent_message_chunk" | "agent_message" => update
                 .get("content")
                 .and_then(content_text)
                 .map(|text| vec![ConversationEvent::MessageChunk { text }])
                 .unwrap_or_default(),
-            "agent_thought_chunk" => update
+            "agent_thought_chunk" | "agent_thought" => update
                 .get("content")
                 .and_then(content_text)
                 .map(|text| vec![ConversationEvent::ThoughtChunk { text }])
                 .unwrap_or_default(),
-            "user_message_chunk" => self
+            "user_message_chunk" | "user_message" => self
                 .ingest_user_chunk(update)
                 .map(|chunk| vec![ConversationEvent::UserMessage { text: chunk.text }])
                 .unwrap_or_default(),
+            "notice" => {
+                let message = [
+                    update.get("title").and_then(|v| v.as_str()),
+                    update
+                        .get("description")
+                        .or_else(|| update.get("message"))
+                        .and_then(|v| v.as_str()),
+                ]
+                .into_iter()
+                .flatten()
+                .filter(|v| !v.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+                if message.is_empty() {
+                    vec![]
+                } else {
+                    vec![ConversationEvent::Notice { message }]
+                }
+            }
+            "compaction_update" => match update.get("status").and_then(|v| v.as_str()) {
+                Some("in_progress") => vec![ConversationEvent::Notice {
+                    message: "コンテキストを圧縮しています…".into(),
+                }],
+                Some("completed") => vec![ConversationEvent::Notice {
+                    message: "コンテキストの圧縮が完了しました".into(),
+                }],
+                _ => vec![],
+            },
+            "plan_removed" => vec![ConversationEvent::Plan { entries: vec![] }],
             "tool_call" => {
                 let id = update
                     .get("toolCallId")
@@ -186,7 +250,8 @@ impl AcpTranslator {
                 let mut out = vec![ConversationEvent::ToolCall {
                     id: id.clone(),
                     name: update
-                        .get("title")
+                        .get("name")
+                        .or_else(|| update.get("title"))
                         .and_then(|v| v.as_str())
                         .or_else(|| update.get("kind").and_then(|v| v.as_str()))
                         .unwrap_or("tool")
@@ -207,28 +272,48 @@ impl AcpTranslator {
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
                 let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                // in_progress 等の中間 update は流さない（終端だけ表示 — 頻度を抑える）。
-                if !is_terminal(status) {
-                    return Vec::new();
-                }
                 let mut out = Vec::new();
-                if !self.started_tools.remove(id) {
+                if !self.started_tools.contains(id)
+                    && (status == "in_progress" || status == "pending" || is_terminal(status))
+                {
                     out.push(ConversationEvent::ToolCall {
                         id: id.to_string(),
                         name: update
-                            .get("title")
+                            .get("name")
+                            .or_else(|| update.get("title"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("tool")
                             .to_string(),
                         input: update.get("rawInput").cloned().unwrap_or_default(),
                     });
+                    self.started_tools.insert(id.to_string());
                 }
-                out.push(tool_result(update, id, status));
+                if is_terminal(status) {
+                    self.started_tools.remove(id);
+                    out.push(tool_result(update, id, status));
+                }
                 out
             }
-            "plan" => {
-                let entries = update
+            "plan" | "plan_update" => {
+                let plan = update.get("plan").unwrap_or(update);
+                if plan.get("type").and_then(|v| v.as_str()) == Some("markdown") {
+                    return plan
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .map(|text| {
+                            vec![ConversationEvent::Plan {
+                                entries: vec![PlanEntry {
+                                    content: text.into(),
+                                    status: "in_progress".into(),
+                                    active_form: None,
+                                }],
+                            }]
+                        })
+                        .unwrap_or_default();
+                }
+                let entries = plan
                     .get("entries")
+                    .or_else(|| plan.get("items"))
                     .and_then(|v| v.as_array())
                     .map(|a| {
                         a.iter()
@@ -247,7 +332,7 @@ impl AcpTranslator {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                if entries.is_empty() {
+                if entries.is_empty() && kind == "plan" {
                     Vec::new()
                 } else {
                     vec![ConversationEvent::Plan { entries }]
@@ -392,7 +477,7 @@ mod tests {
             tr.ingest(&call),
             vec![ConversationEvent::ToolCall {
                 id: "call_7800946240387568052".into(),
-                name: "File hello.txt".into(),
+                name: "write_file".into(),
                 input: serde_json::json!({"Content":"hi","Overwrite":true,"Path":"/tmp/hello.txt"}),
             }]
         );
@@ -425,7 +510,7 @@ mod tests {
             vec![
                 ConversationEvent::ToolCall {
                     id: "c1".into(),
-                    name: "ls".into(),
+                    name: "run_command".into(),
                     input: serde_json::json!({"CommandLine":"ls"}),
                 },
                 ConversationEvent::ToolCallUpdate {

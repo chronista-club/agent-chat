@@ -40,7 +40,20 @@ pub fn extract_available_commands(
     if update.get("sessionUpdate").and_then(|v| v.as_str()) != Some("available_commands_update") {
         return None;
     }
-    let arr = update.get("availableCommands")?.as_array()?;
+    extract_init_commands(update)
+}
+
+/// initialize / session responses may carry commands directly or in extension metadata.
+pub fn extract_init_commands(
+    meta: &serde_json::Value,
+) -> Option<(Vec<String>, HashMap<String, String>)> {
+    let arr = meta
+        .get("availableCommands")
+        .and_then(|v| v.as_array())
+        .or_else(|| {
+            meta.pointer("/_meta/availableCommands")
+                .and_then(|v| v.as_array())
+        })?;
     let mut commands = Vec::with_capacity(arr.len());
     let mut docs = HashMap::new();
     for item in arr {

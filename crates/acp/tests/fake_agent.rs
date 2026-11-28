@@ -31,6 +31,8 @@ struct Turn {
     delay: Duration,
     /// 応答の前に permission を求める（options）。
     permission: Option<Value>,
+    elicitation: Option<Value>,
+    finish_after_elicitation: bool,
     /// prompt の応答を error にする。
     error: bool,
     /// updates を送った後、応答せずに接続を閉じる。
@@ -50,6 +52,9 @@ struct Script {
     replay: Vec<Value>,
     /// load の応答の後に流す update。
     after_load: Vec<Value>,
+    after_new: Vec<Value>,
+    init_meta: Value,
+    new_commands: Option<Value>,
     load_error: bool,
     /// `session/set_config_option` に答えない。
     config_hang: bool,
@@ -99,12 +104,25 @@ async fn fake_agent(mut peer: Channel, mut script: Script, log: Log) {
                             continue;
                         }
                         Ok(
-                            json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": true}}),
+                            json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": true}, "_meta": script.init_meta}),
                         )
                     }
                     "session/new" => {
                         session = "new-1".to_string();
-                        Ok(json!({"sessionId": session, "configOptions": script.config}))
+                        send(
+                            &peer,
+                            RawJsonRpcMessage::response(
+                                request.id.clone(),
+                                Ok(
+                                    json!({"sessionId": session, "configOptions": script.config, "availableCommands":script.new_commands}),
+                                ),
+                            ),
+                        );
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        for u in &script.after_new {
+                            update(&peer, &session, u);
+                        }
+                        continue;
                     }
                     "session/load" => {
                         session = p["sessionId"].as_str().unwrap_or_default().to_string();
@@ -134,7 +152,7 @@ async fn fake_agent(mut peer: Channel, mut script: Script, log: Log) {
                             Err(agent_client_protocol::Error::invalid_params())
                         } else {
                             for option in &mut script.config {
-                                if option["id"] == id {
+                                if option["id"] == id || option["configId"] == id {
                                     option["currentValue"] = value.clone();
                                 }
                             }
@@ -150,6 +168,30 @@ async fn fake_agent(mut peer: Channel, mut script: Script, log: Log) {
                             return;
                         }
                         if turn.hang {
+                            continue;
+                        }
+                        if let Some(mut form) = turn.elicitation {
+                            form["sessionId"] = json!(session);
+                            send(
+                                &peer,
+                                RawJsonRpcMessage::request(
+                                    "elicitation/create".to_owned(),
+                                    form,
+                                    "elicit-1".to_string(),
+                                )
+                                .unwrap(),
+                            );
+                            if turn.finish_after_elicitation {
+                                send(
+                                    &peer,
+                                    RawJsonRpcMessage::response(
+                                        request.id.clone(),
+                                        Ok(json!({"stopReason":"end_turn"})),
+                                    ),
+                                );
+                            } else {
+                                pending_permission = Some(request.id.clone());
+                            }
                             continue;
                         }
                         if let Some(options) = turn.permission {
@@ -1023,6 +1065,54 @@ async fn config_chosen_mid_conversation_survives_restart() {
     assert_eq!(
         (&sets[3]["configId"], &sets[3]["value"]),
         (&json!("thought_level"), &json!("high"))
+    );
+}
+
+/// v2 形の `configId` / `groupId` で返す engine でも、typed (v1) decode で軸が落ちない。
+/// v1 の `SessionConfigOption` は `id` 必須で、配列は `VecSkipError` なので、
+/// 正規化しないと軸が黙って消える（Santa round 1 の指摘）。
+#[tokio::test]
+async fn v2_shaped_config_ids_survive_typed_responses() {
+    let v2 = vec![
+        json!({"configId": "model", "name": "Model", "type": "select", "currentValue": "a",
+               "options": [{"groupId": "fast", "name": "Fast",
+                            "options": [{"value": "a", "name": "A"}, {"value": "b", "name": "B"}]}]}),
+        json!({"configId": "thought_level", "name": "Thinking", "type": "select",
+               "currentValue": "low", "category": "thought_level",
+               "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]}),
+    ];
+    let mut f = start(
+        vec![Script {
+            config: v2,
+            ..Script::default()
+        }],
+        HostOptions::default(),
+    );
+    f.until(|e| matches!(e, E::SessionInit { .. })).await;
+    let view = f.host.config_view().unwrap();
+    assert_eq!(
+        view.options
+            .iter()
+            .map(|o| o.id.as_str())
+            .collect::<Vec<_>>(),
+        ["model", "thought_level"],
+        "session/new 応答の configId が id に写る"
+    );
+    assert_eq!(
+        view.options[0].choices.len(),
+        2,
+        "groupId の group も平らに残る"
+    );
+    assert_eq!(view.options[1].category.as_deref(), Some("thought_level"));
+
+    let options = f.host.set_config("model", "b").await.unwrap();
+    assert_eq!(
+        options
+            .iter()
+            .map(|o| (o.id.as_str(), o.current_value.as_str()))
+            .collect::<Vec<_>>(),
+        [("model", "b"), ("thought_level", "low")],
+        "set_config_option 応答でも軸が落ちない"
     );
 }
 
@@ -1936,7 +2026,7 @@ async fn load_stream_with_pending_tool_call_then_update_is_one_pair() {
             user("file を作って"),
             E::ToolCall {
                 id: "t1".into(),
-                name: "write hello.txt".into(),
+                name: "write".into(),
                 input: json!({"path": "hello.txt"}),
             },
             E::ToolCallUpdate {
@@ -2339,5 +2429,251 @@ async fn unanswered_config_reapply_does_not_stop_the_host() {
         f.params_of("session/set_config_option").len(),
         1,
         "答えが無ければ、残りの軸は送らずに打ち切る"
+    );
+}
+
+// Spec: mem_1ChUb85e8Zxt8vYkyUonFe
+#[tokio::test]
+async fn stabilized_capabilities_are_advertised() {
+    let mut f = start(vec![Script::default()], HostOptions::default());
+    f.until(|e| matches!(e, E::SessionInit { .. })).await;
+    let log = f.log.lock().unwrap();
+    let init = &log.iter().find(|(m, _)| m == "initialize").unwrap().1;
+    assert_eq!(
+        init["clientCapabilities"]["elicitation"],
+        json!({"form": {}})
+    );
+    assert_eq!(
+        init["clientCapabilities"]["session"],
+        json!({"notices": {}, "compaction": {}})
+    );
+    assert_eq!(init["clientCapabilities"]["plan"], json!({}));
+    assert_eq!(init["clientInfo"]["name"], "agent-chat-acp");
+}
+
+#[tokio::test]
+async fn first_session_init_includes_delayed_new_commands() {
+    let mut f = start(
+        vec![Script {
+            after_new: vec![
+                json!({"sessionUpdate":"available_commands_update","availableCommands":[{"name":"plan","description":"Plan"}]}),
+            ],
+            ..Default::default()
+        }],
+        HostOptions::default(),
+    );
+    let events = f.until(|e| matches!(e, E::SessionInit { .. })).await;
+    let E::SessionInit { slash_commands, .. } = events.last().unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(slash_commands, &["plan"]);
+}
+
+#[tokio::test]
+async fn first_session_init_includes_initialize_meta_commands() {
+    let mut f = start(
+        vec![Script {
+            init_meta: json!({"availableCommands":[{"name":"help","description":"Help"}]}),
+            ..Default::default()
+        }],
+        HostOptions::default(),
+    );
+    let events = f.until(|e| matches!(e, E::SessionInit { .. })).await;
+    let E::SessionInit { slash_commands, .. } = events.last().unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(slash_commands, &["help"]);
+}
+
+#[tokio::test]
+async fn elicitation_emits_question_without_history() {
+    let mut f = start(vec![Script { turns: vec![Turn { elicitation: Some(json!({"mode":"form","message":"Choose","requestedSchema":{"type":"object","properties":{"color":{"type":"string","enum":["red","blue"]}}}})), ..Default::default() }].into(), ..Default::default() }], HostOptions::default());
+    f.until(|e| matches!(e, E::SessionInit { .. })).await;
+    f.host.submit("question", &[]).unwrap();
+    f.until(|e| matches!(e, E::Question { .. })).await;
+    assert!(
+        !f.host
+            .history()
+            .await
+            .unwrap()
+            .events
+            .iter()
+            .any(|e| matches!(e, E::Question { .. }))
+    );
+}
+
+#[tokio::test]
+async fn first_session_init_preserves_direct_response_commands() {
+    let mut f = start(
+        vec![Script {
+            new_commands: Some(json!([{"name":"direct","description":"Direct"}])),
+            ..Default::default()
+        }],
+        HostOptions::default(),
+    );
+    let events = f.until(|e| matches!(e, E::SessionInit { .. })).await;
+    let E::SessionInit { slash_commands, .. } = events.last().unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(slash_commands, &["direct"]);
+}
+
+fn form_turn() -> Turn {
+    Turn {
+        elicitation: Some(
+            json!({"mode":"form","message":"Choose", "requestedSchema":{"type":"object","properties":{"color":{"type":"string","enum":["red","blue"]}}}}),
+        ),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn elicitation_accept_cancel_and_unknown_id() {
+    for cancel in [false, true] {
+        let mut f = start(
+            vec![Script {
+                turns: vec![form_turn()].into(),
+                ..Default::default()
+            }],
+            HostOptions::default(),
+        );
+        f.until(|e| matches!(e, E::SessionInit { .. })).await;
+        f.host.submit("ask", &[]).unwrap();
+        let events = f.until(|e| matches!(e, E::Question { .. })).await;
+        let E::Question {
+            request_id,
+            questions,
+        } = events.last().unwrap()
+        else {
+            unreachable!()
+        };
+        let answers = json!({questions[0].question.clone():"blue"});
+        f.host
+            .respond_permission(request_id, Some(answers), cancel)
+            .await
+            .unwrap();
+        f.until_turn_end().await;
+        assert!(
+            f.host
+                .respond_permission(request_id, None, true)
+                .await
+                .is_err()
+        );
+        let log = f.log.lock().unwrap();
+        let response = &log
+            .iter()
+            .find(|(m, _)| m == "permission_response")
+            .unwrap()
+            .1;
+        assert_eq!(
+            response["result"]["action"],
+            if cancel { "cancel" } else { "accept" }
+        );
+        if !cancel {
+            assert_eq!(response["result"]["content"], json!({"color":"blue"}));
+        } else {
+            assert!(response["result"].get("content").is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn interrupt_cancels_pending_elicitation() {
+    let mut f = start(
+        vec![Script {
+            turns: vec![form_turn()].into(),
+            ..Default::default()
+        }],
+        HostOptions::default(),
+    );
+    f.until(|e| matches!(e, E::SessionInit { .. })).await;
+    f.host.submit("ask", &[]).unwrap();
+    f.until(|e| matches!(e, E::Question { .. })).await;
+    f.host.interrupt().unwrap();
+    f.until_turn_end().await;
+    let log = f.log.lock().unwrap();
+    let response = &log
+        .iter()
+        .find(|(m, _)| m == "permission_response")
+        .unwrap()
+        .1;
+    assert_eq!(response["result"], json!({"action":"cancel"}));
+}
+
+#[tokio::test]
+async fn turn_end_cancels_unanswered_elicitation() {
+    let mut f = start(
+        vec![Script {
+            turns: vec![Turn {
+                finish_after_elicitation: true,
+                ..form_turn()
+            }]
+            .into(),
+            ..Default::default()
+        }],
+        HostOptions::default(),
+    );
+    f.until(|e| matches!(e, E::SessionInit { .. })).await;
+    f.host.submit("ask", &[]).unwrap();
+    let events = f.until_turn_end().await;
+    let request_id = events
+        .iter()
+        .find_map(|e| {
+            if let E::Question { request_id, .. } = e {
+                Some(request_id.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert!(
+        f.host
+            .respond_permission(&request_id, None, true)
+            .await
+            .is_err()
+    );
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if f.log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(m, v)| m == "permission_response" && v["result"]["action"] == "cancel")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn url_elicitation_returns_invalid_params() {
+    let mut f = start(
+        vec![Script {
+            turns: vec![Turn {
+                elicitation: Some(
+                    json!({"mode":"url","message":"Login","url":"https://example.com"}),
+                ),
+                ..Default::default()
+            }]
+            .into(),
+            ..Default::default()
+        }],
+        HostOptions::default(),
+    );
+    f.until(|e| matches!(e, E::SessionInit { .. })).await;
+    f.host.submit("ask", &[]).unwrap();
+    let events = f.until_turn_end().await;
+    assert!(!events.iter().any(|e| matches!(e, E::Question { .. })));
+    let log = f.log.lock().unwrap();
+    assert_eq!(
+        log.iter()
+            .find(|(m, _)| m == "permission_response")
+            .unwrap()
+            .1["error"]["code"],
+        -32602
     );
 }
