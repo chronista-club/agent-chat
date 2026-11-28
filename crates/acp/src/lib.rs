@@ -3,6 +3,7 @@
 //! - 純関数（calculations）: [`translate`]・[`config`]・[`session_meta`]・[`permission`]・[`history`]
 //! - actions: [`host`]（process の起動、接続、命令のループ）
 pub mod config;
+pub mod elicitation;
 pub mod history;
 pub mod host;
 pub mod permission;

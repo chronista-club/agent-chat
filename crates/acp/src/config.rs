@@ -34,6 +34,8 @@ pub struct AcpConfigChoice {
 pub struct AcpConfigOption {
     /// 軸の id（`model` / `thought_level` / `mode` …）。`set_config_option` の `configId`。
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
     /// 表示名（`Thinking Level` 等）。
     pub name: String,
     /// engine 上の現在値。
@@ -62,7 +64,11 @@ pub fn parse_config_options(value: &serde_json::Value) -> Option<Vec<AcpConfigOp
         arr.iter()
             .filter(|opt| opt.get("type").and_then(|v| v.as_str()) == Some("select"))
             .filter_map(|opt| {
-                let id = opt.get("id").and_then(|v| v.as_str())?.to_string();
+                let id = opt
+                    .get("configId")
+                    .or_else(|| opt.get("id"))
+                    .and_then(|v| v.as_str())?
+                    .to_string();
                 let name = opt
                     .get("name")
                     .and_then(|v| v.as_str())
@@ -88,6 +94,10 @@ pub fn parse_config_options(value: &serde_json::Value) -> Option<Vec<AcpConfigOp
                 }
                 Some(AcpConfigOption {
                     id,
+                    category: opt
+                        .get("category")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned),
                     name,
                     current_value,
                     choices,
@@ -117,6 +127,43 @@ fn parse_choice(item: &serde_json::Value) -> Option<AcpConfigChoice> {
     })
 }
 
+/// 応答の `configOptions` を、SDK の v1 型が読める形へその場で直す（純関数）。
+///
+/// v1 の `SessionConfigOption` は `id`、group は `group` が必須で、配列は `VecSkipError` で
+/// decode される。v2 形（`configId` / `groupId`）のまま渡すと **エラーにならず軸が黙って消える**
+/// ため、host は response dispatch（typed decode の前）でこれを通す。
+/// 既に `id` / `group` がある要素はそのまま（v1 の値を優先）。
+///
+/// `parse_config_options` 自身も `configId` を読むが、それが効くのは raw JSON のまま届く
+/// `session/update`（`config_option_update`）の経路だけ。応答の経路はこの正規化が担う。
+pub fn normalize_v1_config_options(response: &mut serde_json::Value) {
+    let Some(options) = response
+        .get_mut("configOptions")
+        .and_then(|v| v.as_array_mut())
+    else {
+        return;
+    };
+    for option in options.iter_mut().filter_map(|o| o.as_object_mut()) {
+        if !option.contains_key("id")
+            && let Some(id) = option.get("configId").cloned()
+        {
+            option.insert("id".into(), id);
+        }
+        let groups = option.get_mut("options").and_then(|v| v.as_array_mut());
+        for group in groups
+            .into_iter()
+            .flatten()
+            .filter_map(|g| g.as_object_mut())
+        {
+            if !group.contains_key("group")
+                && let Some(id) = group.get("groupId").cloned()
+            {
+                group.insert("group".into(), id);
+            }
+        }
+    }
+}
+
 /// `session/update` の `config_option_update` から `configOptions` を写す（純関数）。
 pub fn parse_config_option_update(update: &serde_json::Value) -> Option<Vec<AcpConfigOption>> {
     if update.get("sessionUpdate").and_then(|v| v.as_str()) != Some("config_option_update") {
@@ -143,6 +190,30 @@ pub fn needs_apply(options: &[AcpConfigOption], config_id: &str, value: &str) ->
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn normalize_v1_config_options_fills_id_and_group_without_overwriting() {
+        let mut v = serde_json::json!({"configOptions": [
+            {"configId": "model", "options": [{"groupId": "g", "options": []}, {"value": "x"}]},
+            {"id": "keep", "configId": "other", "options": [{"group": "k", "groupId": "z"}]},
+            "not-an-object"
+        ]});
+        super::normalize_v1_config_options(&mut v);
+        let o = &v["configOptions"];
+        assert_eq!(o[0]["id"], "model");
+        assert_eq!(o[0]["options"][0]["group"], "g");
+        assert!(
+            o[0]["options"][1].get("group").is_none(),
+            "候補に group は足さない"
+        );
+        assert_eq!(o[1]["id"], "keep", "既存の id を優先");
+        assert_eq!(o[1]["options"][0]["group"], "k");
+        assert_eq!(o[2], "not-an-object");
+        // configOptions が無い応答は触らない
+        let mut none = serde_json::json!({"sessionId": "s"});
+        super::normalize_v1_config_options(&mut none);
+        assert_eq!(none, serde_json::json!({"sessionId": "s"}));
+    }
+
     use super::*;
 
     /// 実測 wire（agy 1.5.9 の session/new result の configOptions、候補は一部省略）。

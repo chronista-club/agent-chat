@@ -7,7 +7,7 @@
 ## Abstract
 
 agent-chat に、ACP（Agent Client Protocol、protocol v1）の **client host** を置く。
-ACP の接続・型・順序の管理は、公式の Rust SDK `agent-client-protocol` 5.3.0 に任せる。
+ACP の接続・型・順序の管理は、公式の Rust SDK `agent-client-protocol` 5.6.1 に任せる。
 
 - **今**: VP は ACP engine（grok / opencode / agy）を `AcpAgentHost` で動かしている。
   - JSON-RPC を手で組み、`session/update` を自前で解釈している
@@ -41,7 +41,7 @@ ACP の接続・型・順序の管理は、公式の Rust SDK `agent-client-prot
 
 | 依存 | 用途 |
 |---|---|
-| `agent-client-protocol = "5.3"`（feature なし） | 接続・型・dispatch。`process` / `stdio` は使わない — async-io の reactor と blocking の thread pool を持ち込む（SDK `src/stdio.rs`） |
+| `agent-client-protocol = { version = "5.6.1", default-features = false }` | 接続・型・dispatch。`process` / `stdio` は使わない — async-io の reactor と blocking の thread pool を持ち込む（SDK `src/stdio.rs`） |
 | `agent-chat-protocol` | 出力の `ConversationEvent` |
 | `tokio`（process / io-util / sync / macros / rt） | process の起動、命令の channel |
 | `tokio-util`（feature `compat`） | tokio の pipe を futures の `AsyncRead` / `AsyncWrite` に変える（`ByteStreams` の要求） |
@@ -432,7 +432,7 @@ load の流れ（VP lead の実測）:
 ### リスク
 
 - **`serde_json` の `preserve_order`**: SDK（`agent-client-protocol` 5.3.0 と `agent-client-protocol-schema` 1.18.0）が有効にする（`cargo tree -e features -i serde_json` で確認）。feature は build 全体で 1 つにまとまるので、この crate に依存する binary では `serde_json::Value` の key の順が「辞書順」から「入れた順」に変わる。agent-chat の中では、protocol の fixture の key を辞書順に書いて生成物を変えないようにした。consumer への影響（JSON の文字列を比べている所）は Stage 2 の前に consumer 側で調べる
-- **SDK の版は consumer の lock で決まる**: path 依存は agent-chat の `Cargo.lock` を連れていかない。consumer が何もしないと新しい版（5.4.0 / schema 1.19.0 など）を引く。VP は lock で 5.3.0 / 1.18.0 に揃えている。agent-chat が版を上げる時は consumer に知らせる
+- **SDK の版は consumer の lock で決まる**: path 依存は agent-chat の `Cargo.lock` を連れていかない。consumer が何もしないと新しい版（5.4.0 / schema 1.19.0 など）を引く。Stage 2 当初の VP は lock で 5.3.0 / 1.18.0 に揃えた。agent-chat が版を上げる時は consumer に知らせる
 - **SDK の版の追従**: 5.x で、schema は `=` で固定され、minor の版でも動く。unstable の feature は使わない。版は workspace の 1 か所で持つ
 - **境界**: process を共有側が持つ最初の host になる。load の失敗の扱いが、VP の今（黙って新規）と design 86（変換しない）で食い違う。方針を注入にして既定は `Fail`、VP は `NewSession` を渡す
 - **GFP**: crate を分けるので、GFP が依存するまで build に影響しない
@@ -484,3 +484,40 @@ engine ごとの「2 人の書き手」（VP の acp-stage2 lane の実測、202
 - opencode は、生きた process が 2 人目の turn を知っていた。process が共有の background service につなぐ作りだから、というのは推測（`opencode --help` の文言から）
 - `restart()` は 3 つのどれでも安全側に働く（opencode では要らないだけ）。engine ごとに呼ぶかどうかは呼び手が決める
 - opencode は `user_message_chunk` / `agent_message_chunk` / `agent_thought_chunk` の全部に `messageId` を付ける（会話中も load でも）。1 つの発話が複数の chunk に分かれる例は取れていない（短い発話 4 つで 1 発話 1 chunk）。会話中は `user_message_chunk` が来ない
+
+## Form elicitation と安定化通知（Phase 1）
+
+関連: `mem_1ChUb85e8Zxt8vYkyUonFe`、`mem_1ChUb9syhgm8EsWKkcr5c8`。
+SDK は 5.6.1（default features 無効）に更新するが、接続は引き続き protocol v1。
+`elicitation.form`、`session.notices`、`session.compaction`、`plan` と clientInfo を宣伝する。
+`auth.terminal` は false を維持する。対話端末で認証を実行する導線を持たないためである。
+
+- `elicitation/create` の form を `Question` に写し、PromptCard の回答を
+  `respond_permission(request_id, answers, cancel)` で返す。URL mode と未対応の型は
+  invalid_params で断る。質問は制御面なので history に保存しない。
+- Question の質問文は UI の回答 map のキーでもある。同じ description/title が並ぶ場合も
+  一意にする。元の property 名と型は保留 request に保持する。
+- enum / oneOf / anyOf は const 値を回答 label にし、title を補足表示する。
+  array は複数選択、boolean は Yes/No、文字列と数値は自由記述に写す。
+  数値の変換に失敗した場合は入力文字列を保持する。
+- turn 終了、中断、接続破棄では残る responder を cancel で閉じる。
+  切断済み transport への配送そのものは保証できない。未知・使用済み request ID はエラー。
+- 初期 command は initialize と session 応答のメタデータ、初期通知から集める。
+  SDK v1 が応答直下の availableCommands を落とすため、response dispatch で
+  `_meta.availableCommands` に保持してから SDK の型へ渡す。
+  新規 session でも溜まった通知を読み、commands が無いときは合計 50 ms まで待つ。
+  それ以降の通知も通常の受信 loop で SessionInit を更新する。
+- config は category を保持し、configId / id の両方を読む。groupId / group の
+  グループ識別子はどちらも UI に持ち越さず、options を平らにする。
+  応答（session/new・load・set_config_option）は SDK の v1 型で decode され、
+  `id` / `group` が無い要素は `VecSkipError` で**エラーにならず黙って消える**。そのため
+  response dispatch で `configId → id`・`groupId → group` を補ってから型へ渡す
+  （`config::normalize_v1_config_options`、既存の `id` / `group` を優先）。
+  `parse_config_options` の configId 読みが直接効くのは raw JSON で届く
+  `config_option_update` 通知の経路。
+- notice、compaction_update、plan_update / plan_removed、全文メッセージ、
+  programmatic tool name、cancelled、構造化 diff の changes / patch.text を表示へ写す。
+  これは通知 payload の互換翻訳であり、v2 の接続や session/resume の実装ではない。
+
+検証入口: `crates/acp/tests/fake_agent.rs`、`elicitation.rs`、`stabilized.rs`。
+実 CLI の新バージョンで質問カードを操作する確認は、アプリ統合後に別途行う。
