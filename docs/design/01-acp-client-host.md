@@ -502,9 +502,10 @@ SDK は 5.6.1（default features 無効）に更新するが、接続は引き�
   数値の変換に失敗した場合は入力文字列を保持する。
 - turn 終了、中断、接続破棄では残る responder を cancel で閉じる。
   切断済み transport への配送そのものは保証できない。未知・使用済み request ID はエラー。
-  turn 終了と中断では、閉じた質問ごとに `PermissionCancelled { request_id }` を出す（claude の
-  `control_cancel_request` と同じ event）。UI は答え先の無いカードをその id で閉じる。接続破棄
-  （立て直し・停止）では出さず、`EngineExited` が残りを閉じる合図になる。
+  turn 終了と中断、接続を畳む時（停止・立て直し・engine の終了）には、閉じた質問ごとに
+  `PermissionCancelled { request_id }` を出す（claude の `control_cancel_request` と同じ event）。
+  UI は答え先の無いカードをその id で閉じる。`stop()` と立て直しは `EngineExited` を出さないので、
+  この event が UI にとって唯一の合図になる。
 - 初期 command は initialize と session 応答のメタデータ、初期通知から集める。
   SDK v1 が応答直下の availableCommands を落とすため、response dispatch で
   `_meta.availableCommands` に保持してから SDK の型へ渡す。
