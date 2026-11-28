@@ -2616,6 +2616,33 @@ async fn interrupt_cancels_pending_elicitation() {
     assert_eq!(response["result"], json!({"action":"cancel"}));
 }
 
+/// 止めた時も、答えていない質問を id ごとに知らせる（`stop()` は `EngineExited` を出さないので、
+/// これが無いと UI のカードが答え先の無いまま残る。santa round 3）。
+#[tokio::test]
+async fn stop_announces_cancelled_elicitation() {
+    let mut f = start(
+        vec![Script {
+            turns: vec![form_turn()].into(),
+            ..Default::default()
+        }],
+        HostOptions::default(),
+    );
+    f.until(|e| matches!(e, E::SessionInit { .. })).await;
+    f.host.submit("ask", &[]).unwrap();
+    let asked = f.until(|e| matches!(e, E::Question { .. })).await;
+    let Some(E::Question { request_id, .. }) = asked.last() else {
+        unreachable!()
+    };
+    let request_id = request_id.clone();
+    f.host.stop();
+    f.until(|e| {
+        *e == E::PermissionCancelled {
+            request_id: request_id.clone(),
+        }
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn turn_end_cancels_unanswered_elicitation() {
     let mut f = start(

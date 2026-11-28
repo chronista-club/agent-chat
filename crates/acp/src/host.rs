@@ -938,7 +938,10 @@ async fn run_connection(
             ctx.phase.send_replace(Phase::Ready);
             tokio::select! {
                 biased;
-                () = ctx.stopped() => return Ok(Exit::Stop),
+                () = ctx.stopped() => {
+                    conn.cancel_elicitations(Some(ctx));
+                    return Ok(Exit::Stop);
+                }
                 () = reapply_config(&cx, ctx, &conn.session_id) => {}
             }
             if let Some(init) = ctx.build_session_init() {
@@ -947,7 +950,12 @@ async fn run_connection(
             if let Some(reply) = restarting.take() {
                 let _ = reply.send(Ok(ctx.snapshot()));
             }
-            Ok(conn.run(&cx, ctx, commands).await)
+            let exit = conn.run(&cx, ctx, commands).await;
+            // どう終わっても（止める・立て直す・engine の終了）、答えていない質問を id ごとに
+            // 知らせてから畳む。stop() / restart() は EngineExited を出さないので、これが UI に
+            // とって唯一の合図になる。
+            conn.cancel_elicitations(Some(ctx));
+            Ok(exit)
         })
         .await;
     result.unwrap_or_else(|e| {
@@ -1456,8 +1464,9 @@ impl Connection {
     /// （claude の `control_cancel_request` と同じ event。turn の終わりで一律に閉じると、turn を
     /// またいで答えを待つ engine のカードまで閉じてしまう）。
     ///
-    /// `Drop`（立て直し・停止）では ctx が無いので出さない。その時は接続が終わるので、UI は
-    /// `EngineExited` で残りのカードを閉じる。
+    /// 呼ぶ場所: 中断、turn の終わり、接続を畳む時（`run` を抜けた直後 = 停止・立て直し・
+    /// engine の終了のどれでも）。`Drop` は ctx が無いので出さない — そこに残っているのは、
+    /// 上で知らせる前に接続ごと捨てられた分（確定の途中で止めた等）だけ。
     fn cancel_elicitations(&mut self, ctx: Option<&Arc<Ctx>>) {
         for (request_id, (responder, _)) in self.pending_elicitations.drain() {
             let _ = responder.respond(serde_json::json!({"action":"cancel"}));
