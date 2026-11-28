@@ -1366,7 +1366,7 @@ impl Connection {
                         }
                         return;
                     }
-                    // permission is handled by the builder; unknown requests are rejected.
+                    // permission は builder の handler が先に答える。ここに来るのは未対応の要求。
                     tracing::warn!(method = request.method(), "未対応の要求を断る");
                     let _ = responder
                         .respond_with_error(agent_client_protocol::Error::method_not_found());

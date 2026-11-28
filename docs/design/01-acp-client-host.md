@@ -431,7 +431,7 @@ load の流れ（VP lead の実測）:
 
 ### リスク
 
-- **`serde_json` の `preserve_order`**: SDK（`agent-client-protocol` 5.3.0 と `agent-client-protocol-schema` 1.18.0）が有効にする（`cargo tree -e features -i serde_json` で確認）。feature は build 全体で 1 つにまとまるので、この crate に依存する binary では `serde_json::Value` の key の順が「辞書順」から「入れた順」に変わる。agent-chat の中では、protocol の fixture の key を辞書順に書いて生成物を変えないようにした。consumer への影響（JSON の文字列を比べている所）は Stage 2 の前に consumer 側で調べる
+- **`serde_json` の `preserve_order`**: SDK（`agent-client-protocol` 5.3.0 / schema 1.18.0 から、2026-11-28 時点の 5.6.1 / schema 1.22.0 まで）が有効にする（`cargo tree -e features -i serde_json` で確認）。feature は build 全体で 1 つにまとまるので、この crate に依存する binary では `serde_json::Value` の key の順が「辞書順」から「入れた順」に変わる。agent-chat の中では、protocol の fixture の key を辞書順に書いて生成物を変えないようにした。consumer への影響（JSON の文字列を比べている所）は Stage 2 の前に consumer 側で調べる
 - **SDK の版は consumer の lock で決まる**: path 依存は agent-chat の `Cargo.lock` を連れていかない。consumer が何もしないと新しい版（5.4.0 / schema 1.19.0 など）を引く。Stage 2 当初の VP は lock で 5.3.0 / 1.18.0 に揃えた。agent-chat が版を上げる時は consumer に知らせる
 - **SDK の版の追従**: 5.x で、schema は `=` で固定され、minor の版でも動く。unstable の feature は使わない。版は workspace の 1 か所で持つ
 - **境界**: process を共有側が持つ最初の host になる。load の失敗の扱いが、VP の今（黙って新規）と design 86（変換しない）で食い違う。方針を注入にして既定は `Fail`、VP は `NewSession` を渡す
@@ -516,8 +516,11 @@ SDK は 5.6.1（default features 無効）に更新するが、接続は引き�
   `parse_config_options` の configId 読みが直接効くのは raw JSON で届く
   `config_option_update` 通知の経路。
 - notice、compaction_update、plan_update / plan_removed、全文メッセージ、
-  programmatic tool name、cancelled、構造化 diff の changes / patch.text を表示へ写す。
+  cancelled、構造化 diff の changes / patch.text を表示へ写す。
   これは通知 payload の互換翻訳であり、v2 の接続や session/resume の実装ではない。
+- tool の表示名は呼び出しごとの `title` を先に使い、programmatic な `name` は `title` が無い時だけ使う
+  （agy 1.5.9 の実測: `title` = `ls` / `File hello.txt`、`name` = `run_command` / `write_file`。
+  `name` を先にすると consumer の要約（VP の now-line 等）から情報が減る）。
 
 検証入口: `crates/acp/tests/fake_agent.rs`、`elicitation.rs`、`stabilized.rs`。
 実 CLI の新バージョンで質問カードを操作する確認は、アプリ統合後に別途行う。

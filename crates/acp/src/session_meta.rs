@@ -43,7 +43,7 @@ pub fn extract_available_commands(
     extract_init_commands(update)
 }
 
-/// initialize / session responses may carry commands directly or in extension metadata.
+/// initialize / session の応答は command を直下か拡張メタデータ（`_meta.availableCommands`）に載せることがある。
 pub fn extract_init_commands(
     meta: &serde_json::Value,
 ) -> Option<(Vec<String>, HashMap<String, String>)> {

@@ -250,8 +250,10 @@ impl AcpTranslator {
                 let mut out = vec![ConversationEvent::ToolCall {
                     id: id.clone(),
                     name: update
-                        .get("name")
-                        .or_else(|| update.get("title"))
+                        // 表示名は呼び出しごとの title が先。name（programmatic な tool 名）は
+                        // title が無い engine の時だけ使う（agy: title = `ls`、name = `run_command`）。
+                        .get("title")
+                        .or_else(|| update.get("name"))
                         .and_then(|v| v.as_str())
                         .or_else(|| update.get("kind").and_then(|v| v.as_str()))
                         .unwrap_or("tool")
@@ -279,8 +281,8 @@ impl AcpTranslator {
                     out.push(ConversationEvent::ToolCall {
                         id: id.to_string(),
                         name: update
-                            .get("name")
-                            .or_else(|| update.get("title"))
+                            .get("title")
+                            .or_else(|| update.get("name"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("tool")
                             .to_string(),
@@ -345,6 +347,29 @@ impl AcpTranslator {
 
 #[cfg(test)]
 mod tests {
+    /// 表示名は呼び出しごとの `title` が先（agy 1.5.9 の実測: `title` = `ls` / `File hello.txt`、
+    /// `name` = `run_command` / `write_file`）。`title` が無い engine だけ `name` を使う。
+    #[test]
+    fn tool_call_name_falls_back_to_programmatic_name_only_without_title() {
+        let mut tr = AcpTranslator::new();
+        let events = tr.ingest(&serde_json::json!({
+            "sessionUpdate": "tool_call", "toolCallId": "n1", "name": "write_file",
+            "status": "in_progress", "kind": "edit"
+        }));
+        assert!(
+            matches!(&events[..], [ConversationEvent::ToolCall { name, .. }] if name == "write_file"),
+            "{events:?}"
+        );
+        let events = tr.ingest(&serde_json::json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": "n2", "name": "run_command",
+            "title": "ls", "status": "in_progress"
+        }));
+        assert!(
+            matches!(&events[..], [ConversationEvent::ToolCall { name, .. }] if name == "ls"),
+            "{events:?}"
+        );
+    }
+
     use super::*;
 
     /// VP design 42 §1 の実測 wire（grok 0.2.64）そのままの update で主経路を固定。
@@ -477,7 +502,7 @@ mod tests {
             tr.ingest(&call),
             vec![ConversationEvent::ToolCall {
                 id: "call_7800946240387568052".into(),
-                name: "write_file".into(),
+                name: "File hello.txt".into(),
                 input: serde_json::json!({"Content":"hi","Overwrite":true,"Path":"/tmp/hello.txt"}),
             }]
         );
@@ -510,7 +535,7 @@ mod tests {
             vec![
                 ConversationEvent::ToolCall {
                     id: "c1".into(),
-                    name: "run_command".into(),
+                    name: "ls".into(),
                     input: serde_json::json!({"CommandLine":"ls"}),
                 },
                 ConversationEvent::ToolCallUpdate {

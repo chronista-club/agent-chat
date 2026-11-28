@@ -1,9 +1,13 @@
-//! Form elicitation ↔ PromptCard. Question text is the UI answer key; property names stay private.
+//! ACP の form elicitation ↔ PromptCard の写し。
+//!
+//! 質問文が UI の回答 map のキーになる。schema の property 名と型は外に出さず、保留中の request 側
+//! （[`ElicitationFieldKind`]）に持って、回答を content へ戻す時に使う。
 use std::collections::HashSet;
 
 use agent_chat_protocol::{QuestionOption, QuestionSpec};
 use serde_json::{Map, Value};
 
+/// form の 1 field（property 名・質問文・型・選択肢）。回答を content へ戻す時に使う。
 #[derive(Debug, Clone)]
 pub struct ElicitationFieldKind {
     key: String,
@@ -12,6 +16,8 @@ pub struct ElicitationFieldKind {
     options: Vec<String>,
 }
 
+/// `elicitation/create` の params を PromptCard の質問へ写す（純関数）。form 以外の mode・
+/// 未対応の型は Err（host が invalid_params で断る）。
 pub fn parse_elicitation_questions(
     params: &Value,
 ) -> Result<(Vec<QuestionSpec>, Vec<ElicitationFieldKind>), String> {
@@ -132,6 +138,7 @@ pub fn parse_elicitation_questions(
     Ok((questions, fields))
 }
 
+/// PromptCard の回答 map（質問文 → 回答）を、form の property 名をキーにした content へ戻す（純関数）。
 pub fn build_elicitation_content(fields: &[ElicitationFieldKind], answers: &Value) -> Value {
     let mut content = Map::new();
     for field in fields {
@@ -140,7 +147,7 @@ pub fn build_elicitation_content(fields: &[ElicitationFieldKind], answers: &Valu
         };
         let value = match field.kind.as_str() {
             "array" => {
-                // A single enum value can itself contain the PromptCard delimiter.
+                // enum の値 1 つの中に PromptCard の区切り文字が入っていることがある。
                 let mut values = Vec::new();
                 let mut remaining = answer;
                 while !remaining.is_empty() {
