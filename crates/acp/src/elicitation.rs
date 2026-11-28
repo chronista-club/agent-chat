@@ -239,11 +239,20 @@ pub fn build_elicitation_content(fields: &[ElicitationFieldKind], answers: &Valu
         let Some(answer) = answers.get(&field.question).and_then(Value::as_str) else {
             continue;
         };
+        // label を先に引く。oneOf の数字の title が別の選択肢の const と重なることがある
+        // （agy は const が番号）。const は label に無い時だけ引く（const のままの回答も通す）。
+        // 対の質問では const を引かない — PromptCard は label しか返さないので、label に無い回答は
+        // Other の自由記述（"1" と書かれても選択肢にしない）。
         let value_of = |label: &str| {
-            field
-                .options
+            let options = &field.options;
+            options
                 .iter()
-                .find(|(l, v)| l == label || v == label)
+                .find(|(l, _)| l == label)
+                .or_else(|| {
+                    options
+                        .iter()
+                        .find(|(_, v)| field.write_in_key.is_none() && v == label)
+                })
                 .map(|(_, v)| v.clone())
         };
         let value = match field.kind.as_str() {
@@ -283,7 +292,9 @@ pub fn build_elicitation_content(fields: &[ElicitationFieldKind], answers: &Valu
                 if let Some(write_in_key) = &field.write_in_key
                     && !written.is_empty()
                 {
-                    // 自由記述の中の ", " で割れた分を戻す。
+                    // 自由記述の中の ", " で割れた分を戻す。⚠️ 自由記述が「, 選択肢の label」を含むと
+                    // その部分は選択肢として数えられる（PromptCard が選択と自由記述を ", " で 1 本に
+                    // つないで返すので、ここでは区別できない）。
                     content.insert(write_in_key.clone(), Value::String(written.join(", ")));
                     chosen.extend(field.other_option.clone());
                 }
